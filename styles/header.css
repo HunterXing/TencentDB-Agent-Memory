@@ -1,0 +1,522 @@
+/*!
+ * 站点统一顶栏（含站内搜索弹窗 / toast）+ 跨路由的首帧保护样式。
+ *
+ * 背景：原单文件版官网里，首页用的是 `.site-header`（home.css），子页面用的是 `.site-bar`
+ * （subpage.css）。两套结构与样式，导致在首页与子页面之间切换时顶栏的外观、导航项、
+ * CTA 全部会变。
+ *
+ * 现在所有路由统一渲染 `src/layout/SiteHeader.jsx` 的 `.site-bar` 结构，本文件把
+ * subpage.css 中「顶栏 + 搜索弹窗 + toast」相关规则抽出来，并把颜色/字体收敛成
+ * `--h-*` 自带 token（不依赖任何页面样式表），因此：
+ *   - 顶栏在每个路由上像素级一致，不再受 home.css / subpage.css 差异影响；
+ *   - 首页不需要加载 subpage.css，避免两份页面样式互相覆盖。
+ *
+ * 另外，本文件是**唯一**由 index.html 静态阻塞引入的样式表，因此「在所有路由上都存在、
+ * 且必须首帧就正确」的规则一律放这里（见文末「首帧保护」），不要再下放到页面样式表。
+ */
+
+:root {
+  --h-ink: #1f2937;
+  --h-muted: #68758a;
+  --h-line: #dfe5ee;
+  --h-blue: #1464ff;
+  --h-blue-dark: #0752db;
+  --h-blue-soft: #eaf2ff;
+  --h-shadow: 0 18px 54px rgba(24, 50, 92, 0.11);
+  --h-font-display: "TencentSans-W7", "腾讯体 W7", "TencentSans-W3", "腾讯体 W3", sans-serif;
+  --h-ease: cubic-bezier(.22, 1, .36, 1);
+}
+
+/* 固定顶栏的内容避让。必须放在这份静态引入的 header.css 里，而不是某个页面样式表：
+   子页面原本由 subpage.css 的 `body{padding-top:72px}` 提供，首页则靠 `.hero` 自带的
+   136px 上内边距避让 —— 两套方案不一致，路由切换时 body 的 padding 一增一减，
+   整个文档位移 72px。实测这就是 首页↔架构 跳转的 CLS 0.05 来源
+   （layout-shift 的 source 是一个从 top:72 变到 top:0 的容器）。
+   统一到这里后，首页的 hero 上内边距相应减去 72px，视觉不变（见 home.css）。 */
+body {
+  padding-top: 72px;
+}
+
+/* ---------------------------------------------------------------- 顶栏 */
+.site-bar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: 0;
+  width: 100%;
+  height: 72px;
+  min-height: 72px;
+  max-height: 72px;
+  z-index: 1000;
+  border-bottom: 1px solid rgba(216, 224, 236, 0.94);
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(18px) saturate(145%);
+  -webkit-backdrop-filter: blur(18px) saturate(145%);
+  box-shadow: 0 8px 24px rgba(24, 50, 92, 0.06);
+  transform: translateZ(0);
+  isolation: isolate;
+  /* BUGFIX：原站 “Top bar stability v1” 给 .site-bar 加了 `contain: layout paint style`，
+     会把绝对定位的移动端下拉菜单（.site-nav.is-open，top:72px，超出 72px 高）整体裁掉，
+     窄屏下点开菜单什么都看不到。这里显式关掉（header.css 在 subpage.css 之后加载，可覆盖）。
+     不要改回 paint containment。 */
+  contain: none;
+  /* 顶栏内导航项的统一尺寸。定义在 .site-bar 上而不是 .site-nav 上：
+     「更多」按钮是 .site-nav 的兄弟，拿不到定义在 .site-nav 上的变量，
+     而断点收紧必须同时作用于 GooeyNav 的导航项和「更多」按钮，否则两者宽度对不齐。 */
+  --gn-item-height: 44px;
+  --gn-item-padding: 9px;
+}
+
+.site-bar-inner {
+  width: min(1200px, calc(100% - 40px));
+  height: 72px;
+  min-height: 72px;
+  margin: auto;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+.site-brand {
+  width: 166px;
+  min-width: 166px;
+  display: inline-flex;
+  align-items: center;
+  gap: 11px;
+}
+.site-brand-icon {
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+}
+.site-brand-svg {
+  width: 38px;
+  height: 38px;
+  display: block;
+}
+.site-brand strong {
+  display: block;
+  font-size: 15px;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  font-family: var(--h-font-display);
+}
+.site-brand small {
+  display: block;
+  margin-top: 3px;
+  color: var(--h-muted);
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+/* 导航本体（gooey pill + 粒子）由 src/components/GooeyNav.jsx + GooeyNav.css 提供，
+   这里只负责它在顶栏中的定位与响应式。
+   选择器统一带 `.site-bar` 前缀：组件样式表由 JS 动态注入、位置在静态 header.css 之后，
+   同特异性（0,1,0）的规则会被它盖掉，加一层前缀（0,2,0）才能保证顶栏这侧始终生效
+   —— 尤其是窄屏的 `position: absolute` 下拉定位。 */
+.site-bar .site-nav {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+  /* 这里不设 margin-right: auto —— 右侧留白交给「更多」按钮承担，
+     否则 auto 会把「更多」和操作区一起推到右边，导航与它就分家了。 */
+  margin-right: 0;
+  /* GooeyNav 的容器是 position: relative，任何残留的 top/left 都会把整个导航推走
+     （subpage.css 里曾有一条不限媒体的 `.site-bar .site-nav{top:72px}`，桌面下把导航下移 72px）。
+     这里显式归零，窄屏下拉所需的绝对定位值在 ≤1080px 块中单独给出。 */
+  top: auto;
+  left: auto;
+  right: auto;
+  font-family: var(--h-font-display);
+}
+
+/* 「更多」：唤出 StaggeredMenu 面板。外观刻意与 GooeyNav 的导航项对齐
+   （同高 / 同字号 / 同圆角 / 共用 --gn-item-* 尺寸），让它读起来是导航的最后一项，
+   而不是操作区里的一个独立按钮。 */
+.site-bar .nav-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: var(--gn-item-height, 44px);
+  padding: 0 var(--gn-item-padding, 9px);
+  /* 负左边距抵消 .site-bar-inner 的 flex gap（24px / 窄屏 18px）：不抵消的话
+     「更多」与最后一项的间距会明显大于导航项彼此之间（约 20px），看起来不像同一组。 */
+  margin-left: -12px;
+  margin-right: auto;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: #46536a;
+  font: inherit;
+  font-family: var(--h-font-display);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.2s ease, background-color 0.2s ease;
+}
+.site-bar .nav-more:hover {
+  color: var(--h-blue);
+  background: var(--h-blue-soft);
+}
+.site-bar .nav-more.is-open {
+  color: #fff;
+  background: var(--h-blue);
+}
+.site-bar .nav-more:focus-visible {
+  outline: 2px solid var(--h-blue);
+  outline-offset: 1px;
+}
+.site-bar .nav-more-caret {
+  width: 7px;
+  height: 7px;
+  border-right: 1.6px solid currentColor;
+  border-bottom: 1.6px solid currentColor;
+  transform: translateY(-2px) rotate(45deg);
+  transition: transform 0.2s ease;
+}
+.site-bar .nav-more.is-open .nav-more-caret {
+  transform: translateY(1px) rotate(225deg);
+}
+
+.site-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 40px;
+}
+
+.search-button {
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--h-line);
+  border-radius: 11px;
+  background: #fff;
+  color: var(--h-ink);
+  cursor: pointer;
+  position: relative;
+}
+.search-button::before {
+  content: "";
+  position: absolute;
+  width: 13px;
+  height: 13px;
+  border: 1.8px solid currentColor;
+  border-radius: 50%;
+  left: 11px;
+  top: 10px;
+}
+.search-button::after {
+  content: "";
+  position: absolute;
+  width: 7px;
+  height: 1.8px;
+  background: currentColor;
+  rotate: 45deg;
+  left: 23px;
+  top: 24px;
+}
+
+.github-stat,
+.bar-primary,
+.bar-secondary {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 14px;
+  border-radius: 11px;
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.github-stat {
+  border: 1px solid var(--h-line);
+  background: #fff;
+  color: var(--h-ink);
+}
+.github-stat:hover {
+  border-color: #aab8ce;
+}
+/* 主导 CTA（快速开始） */
+.bar-primary {
+  color: #fff;
+  background: var(--h-blue);
+  box-shadow: 0 7px 20px rgba(20, 100, 255, 0.22);
+}
+.bar-primary:hover {
+  background: var(--h-blue-dark);
+}
+/* 商业化入口（腾讯云购买），弱化处理避免和主导 CTA 抢视觉 */
+.bar-secondary {
+  color: var(--h-blue);
+  background: #fff;
+  border: 1px solid rgba(20, 100, 255, 0.32);
+}
+.bar-secondary:hover {
+  background: var(--h-blue-soft);
+  border-color: rgba(20, 100, 255, 0.55);
+}
+
+.mobile-toggle {
+  display: none;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--h-line);
+  background: #fff;
+  border-radius: 10px;
+  cursor: pointer;
+}
+.mobile-toggle span {
+  display: block;
+  width: 17px;
+  height: 2px;
+  background: var(--h-ink);
+  margin: 4px auto;
+}
+
+/* ---------------------------------------------------------------- 站内搜索弹窗 */
+.search-dialog {
+  border: 0;
+  width: min(680px, calc(100% - 28px));
+  padding: 0;
+  border-radius: 20px;
+  box-shadow: 0 30px 100px rgba(11, 23, 45, 0.28);
+}
+.search-dialog::backdrop {
+  background: rgba(8, 12, 20, 0.42);
+  backdrop-filter: blur(4px);
+}
+.search-shell {
+  padding: 16px;
+}
+.search-head {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  border: 1px solid var(--h-line);
+  border-radius: 13px;
+  padding: 0 12px;
+}
+.search-head input {
+  flex: 1;
+  border: 0;
+  outline: 0;
+  min-height: 50px;
+  background: transparent;
+  font-size: 17px;
+}
+.search-head button {
+  border: 0;
+  background: #eef2f7;
+  border-radius: 7px;
+  padding: 5px 8px;
+  color: var(--h-muted);
+  cursor: pointer;
+}
+.search-results {
+  display: grid;
+  gap: 4px;
+  max-height: 430px;
+  overflow: auto;
+  margin-top: 12px;
+}
+.search-result {
+  display: grid;
+  grid-template-columns: 92px 1fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 11px 12px;
+  border-radius: 11px;
+}
+.search-result:hover {
+  background: #f1f5fb;
+}
+.search-result small {
+  color: var(--h-blue);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.search-result strong {
+  display: block;
+  font-size: 14px;
+}
+.search-result span {
+  color: var(--h-muted);
+  font-size: 12px;
+}
+.search-empty {
+  padding: 36px 16px;
+  color: var(--h-muted);
+  text-align: center;
+}
+
+/* ---------------------------------------------------------------- toast */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 26px;
+  z-index: 1200;
+  translate: -50% 20px;
+  opacity: 0;
+  pointer-events: none;
+  padding: 9px 14px;
+  border-radius: 9px;
+  color: #fff;
+  background: #111a28;
+  transition: 0.2s ease;
+  font-size: 12px;
+}
+.toast.is-visible {
+  opacity: 1;
+  translate: -50% 0;
+}
+
+/* ---------------------------------------------------------------- 响应式 */
+/* 导航项 10 个 + 3 个操作按钮已经接近 1200px 容器上限：
+   窄屏先收起中英切换（只有首页有英文文案），保证商业化入口不被挤掉 */
+@media (max-width: 1200px) {
+  .site-actions .language-switcher {
+    display: none;
+  }
+  /* 收紧间距，保证 1081–1200px 这段「桌面布局」下 10 个导航项 + 3 个操作按钮不溢出 */
+  .site-bar-inner {
+    gap: 18px;
+  }
+  .site-bar {
+    --gn-item-padding: 7px;
+  }
+}
+
+@media (max-width: 1080px) {
+  .site-bar .site-nav {
+    display: none;
+    position: absolute;
+    left: 20px;
+    right: 20px;
+    top: 72px;
+    padding: 12px;
+    border: 1px solid var(--h-line);
+    border-radius: 14px;
+    background: #fff;
+    box-shadow: var(--h-shadow);
+  }
+  /* 打开时是纵向单列面板；GooeyNav 在这一档已经把 ul 改成 grid 并关掉 effect 层 */
+  .site-bar .site-nav.is-open {
+    display: block;
+    z-index: 6;
+    max-height: calc(100vh - 92px);
+    overflow: auto;
+  }
+  .mobile-toggle {
+    display: block;
+  }
+}
+
+@media (max-width: 880px) {
+  .site-actions .bar-secondary {
+    display: none;
+  }
+}
+
+@media (max-width: 720px) {
+  .site-bar-inner {
+    width: min(100% - 24px, 1180px);
+  }
+  .site-brand {
+    width: auto;
+    min-width: max-content;
+  }
+  .site-actions .bar-primary {
+    display: none;
+  }
+}
+
+/* ------------------------------------------------------------ 首帧保护
+ *
+ * 为什么必须放在这里：页面级样式表（home / subpage / wiki）由
+ * `src/components/RouteStyles.jsx` 按路由动态启停，生效时刻晚于「路由内容第一次 commit」。
+ * 原站是「一页一 HTML」，这些规则各自躺在阻塞式 <link> 里；拆成 SPA 后它们落到了动态
+ * 样式表里，首帧就是失效的，于是同一个元素在「无样式 → 有样式」之间跳变，表现为用户
+ * 看到的「突然冒出来一个东西，下一帧又不见了」。典型三例：
+ *
+ *   1. `.skip-link` 无样式时是文档流最前面的一行蓝色链接（会多撑出一行高度）；
+ *   2. home.css 用 `transform: translateY(-160%)` 隐藏它，而 transform 带 180ms 过渡 ——
+ *      样式表每次重新生效，transform 都从 `none` 过渡到 -160%，跳过导航按钮会在左上角
+ *      完整可见地滑一遍再消失；
+ *   3. `.js .reveal` 无样式时内容先完全可见，样式表就绪后瞬间归零再淡入，整屏闪一下。
+ *
+ * 结论：这些「隐藏态」必须是首帧就有效的静态规则，且不能用「带过渡的位移」来实现隐藏。
+ * 页面样式表只负责各自的「可见态 / 深色模式 / 动效曲线」覆盖。
+ */
+
+/* 跳过导航：隐藏态必须「移出视口 + 无过渡」。
+   两个坑：
+   - 不能用 `visibility: hidden` / `display: none`：元素不可聚焦，Tab 永远到不了它，
+     跳过导航本身就失去意义了（实测 `visibility: hidden` 时 .focus() 无效）；
+   - 默认态不能挂 `transition`：页面级样式表每次重新生效都会触发一次 transform 过渡，
+     按钮就完整可见地滑过左上角。过渡只在 :focus 规则里声明 —— 聚焦时是新值生效，
+     所以仍然有滑入动画；失焦回到基础规则，瞬时隐藏，不可能被看见。 */
+.skip-link {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 2000;
+  padding: 11px 16px;
+  border-radius: 10px;
+  background: var(--h-ink);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  transform: translateY(-180%);
+  transition: none;
+}
+.skip-link:focus,
+.skip-link:focus-visible {
+  transform: translateY(0);
+  transition: transform 180ms var(--h-ease);
+}
+
+/* 跟随光晕：静态隐藏态（`.is-visible` 的可见值由各页面样式表控制，含深色模式） */
+.cursor-aurora {
+  width: 160px;
+  height: 140px;
+  position: fixed;
+  z-index: 900;
+  top: 0;
+  left: 0;
+  border-radius: 44% 56% 61% 39% / 46% 42% 58% 54%;
+  background:
+    radial-gradient(circle at 27% 27%, rgba(20, 100, 255, .48), transparent 48%),
+    radial-gradient(circle at 72% 68%, rgba(112, 70, 207, .4), transparent 55%),
+    linear-gradient(135deg, rgba(56, 191, 255, .24), rgba(20, 100, 255, .16) 46%, rgba(134, 75, 226, .24));
+  filter: blur(42px) saturate(118%);
+  mix-blend-mode: multiply;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate3d(-500px, -500px, 0) translate(-50%, -50%) scale(.86);
+  transition: opacity 220ms ease;
+  will-change: transform, opacity;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cursor-aurora { display: none; }
+}
+@media (hover: none), (pointer: coarse) {
+  .cursor-aurora { display: none; }
+}
+
+/* 滚动显现：首帧即隐藏，避免「先闪出内容再淡入」。
+   位移/模糊/时长仍由 home.css 的 `.js .reveal` 提供，这里只兜住「隐藏」这个状态。 */
+.js .reveal { opacity: 0; }
+.js .reveal.is-visible { opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  .js .reveal,
+  .js .reveal.is-visible { opacity: 1; }
+}
