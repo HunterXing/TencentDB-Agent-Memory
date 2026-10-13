@@ -31,6 +31,7 @@ import {
 import { extractSpaceIdFromPath } from "../../credit-reporter.js";
 import { extractSseUsage, flattenMessagesForOpik } from "./openai-chat.js";
 import { resolveSessionKey } from "../../guard-adapter.js";
+import { poolServiceRejection } from "../../pool-service.js";
 import { SKIP_REQUEST_HEADERS_WITH_INTERNAL, filterResponseHeaders } from "../../common/constants.js";
 import {
   stripDirectPrefix,
@@ -66,6 +67,7 @@ function extractApiKey(c: Context): string {
 // (原 direct 独立版本与 anthropic 版本内容完全一致, 唯一差别是不接受 system 参数;
 // 直接不传 system 即达到原行为)。
 import { flattenAnthropicMessagesForOpik } from "./anthropic.js";
+import { hasExplicitAgentName, requireWecomIdentity } from "../../wecom-identity-form.js";
 
 // ─── Observability context + reporters ──────────────────────────────────────
 
@@ -74,6 +76,7 @@ interface DirectObsContext {
   protocol: UpstreamProtocol;
   traceId: string;
   keyId: string;
+  projectName: string;
   sessionKey: string;
   startTime: string;
   upstreamUrl: string;
@@ -109,7 +112,7 @@ function reportUsage(
   try {
     opikCreateLlmSpan(ctx.config, {
       traceId: ctx.traceId,
-      projectName: ctx.keyId,
+      projectName: ctx.projectName,
       name: ctx.modelId,
       startTime: ctx.startTime,
       endTime,
@@ -320,6 +323,8 @@ export async function runDirectPipeline(c: Context, config: ProxyConfig): Promis
   try {
     parsedBody = JSON.parse(bodyText) as Record<string, unknown>;
   } catch { /* non-JSON → 降级为纯透传 (不做观测) */ }
+  const poolRejection = poolServiceRejection(config, parsedBody?.model);
+  if (poolRejection) return c.json(poolRejection, 400);
 
   const modelId = parsedBody && typeof parsedBody.model === "string" ? parsedBody.model : "unknown";
   const messages = parsedBody && Array.isArray(parsedBody.messages) ? parsedBody.messages : [];
@@ -327,6 +332,20 @@ export async function runDirectPipeline(c: Context, config: ProxyConfig): Promis
 
   const apiKey = extractApiKey(c);
   const keyId = apiKey ? apiKeyToKeyId(apiKey) : "unknown";
+  let projectName = keyId;
+  if (hasExplicitAgentName(c.req.path)) {
+    const wecomIdentity = await requireWecomIdentity(
+      config,
+      apiKey,
+      parsedBody ?? {},
+      protocol === "anthropic" ? "anthropic" : "openai",
+    );
+    if (wecomIdentity.kind === "rejected") return wecomIdentity.response;
+    if (wecomIdentity.kind === "intercept") {
+      return c.json({ error: "企业微信名称为必填项；该路由不支持交互式填写" }, 428);
+    }
+    projectName = wecomIdentity.name || keyId;
+  }
   const spaceId = extractSpaceIdFromPath(c.req.path) ?? "";
 
   const lcHeaders: Record<string, string> = {};
@@ -363,8 +382,8 @@ export async function runDirectPipeline(c: Context, config: ProxyConfig): Promis
   if (parsedBody) {
     opikCreateTrace(config, {
       traceId,
-      projectName: keyId,
-      name: `${modelId} / ${keyId}`,
+      projectName,
+      name: `${modelId} / ${projectName}`,
       startTime,
       input: { messages: flatMessages },
       tags: [
@@ -377,7 +396,7 @@ export async function runDirectPipeline(c: Context, config: ProxyConfig): Promis
   }
 
   const obsCtx: DirectObsContext = {
-    config, protocol, traceId, keyId, sessionKey, startTime,
+    config, protocol, traceId, keyId, projectName, sessionKey, startTime,
     upstreamUrl, modelId, spaceId, upstreamRequestId, flatMessages,
   };
 

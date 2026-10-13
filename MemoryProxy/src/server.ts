@@ -1,8 +1,10 @@
 /** Hono app factory — registers all routes. */
 
 import { Hono } from "hono";
-import { runOpenaiChatPipeline as handleChatCompletions } from "./pipeline/runners/openai-chat.js";
-import { runAnthropicPipeline as handleAnthropicMessages } from "./pipeline/runners/anthropic.js";
+import { accessKeyMiddleware } from "./accessKeys.js";
+import { runOpenaiChatPipeline } from "./pipeline/runners/openai-chat.js";
+import { runAnthropicPipeline } from "./pipeline/runners/anthropic.js";
+import { withClientFacingModel } from "./response-model-mask.js";
 import { runUtilityPipeline as handleAuxiliaryEndpoint } from "./pipeline/runners/utility.js";
 import { runDirectPipeline as handleDirectPassthrough } from "./pipeline/runners/direct.js";
 import { runCodexPipeline as handleCodexEndpoint } from "./pipeline/runners/codex.js";
@@ -19,8 +21,14 @@ import { tryActivateStorage, tryActivateRedis } from "./injection/index.js";
 import { getEffectiveBackend } from "./storage/factory.js";
 import type { ProxyConfig } from "./types.js";
 
+const handleChatCompletions = withClientFacingModel(runOpenaiChatPipeline);
+const handleAnthropicMessages = withClientFacingModel(runAnthropicPipeline);
+
 export function createApp(config: ProxyConfig): Hono {
   const app = new Hono();
+
+  const accessKeysFile = process.env.TDAI_PROXY_ACCESS_KEYS_FILE?.trim();
+  if (accessKeysFile) app.use("*", accessKeyMiddleware(accessKeysFile));
 
   // Eagerly activate storage/bindingRepo so bridge-only requests (no main
   // /v1/messages hits yet) can still recover session state via L2 fallthrough
@@ -372,7 +380,7 @@ export function createApp(config: ProxyConfig): Hono {
   app.post("/:agent/v1/chat/completions", (c) => handleChatCompletions(c, config));
 
   // Legacy /proxy/<spaceId>/ prefix — 不带 agent 段，按 path 后缀分派协议。
-  // 这条入口只做路由 / 压缩 / 计费；handler 内见 isLegacyProxyPath，记忆类
+  // 这条入口只做路由 / 压缩 / 计费 / 会话上传（不区分 subagent）；handler 内见 isLegacyProxyPath，记忆类
   // 功能（session-init / mem 命令 / injection / L0 / skill）一律关闭。
   app.post("/proxy/:spaceId/v1/messages", (c) => handleAnthropicMessages(c, config));
   app.post("/proxy/:spaceId/v1/messages/count_tokens", (c) => handleAuxiliaryEndpoint(c, config));

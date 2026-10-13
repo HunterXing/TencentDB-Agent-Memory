@@ -62,7 +62,7 @@ upstream:
   agents: {}
     # claude-code:                                        # 服务端 key 模式
     #   url: "https://claude-upstream.example.com/v1"
-    #   apiKey: "sk-ant-agent-key"
+    #   apiKey: "example-only-agent-key"
     # codex:                                              # 客户端 key 透传模式
     #   url: "https://codex-upstream.example.com/v1"
     #   # 不写 apiKey → 透传客户端自己带上来的 key，不走外层兜底
@@ -131,18 +131,18 @@ redis:
 # ── Cost Guard（可选私有路由扩展；未初始化 submodule 时整段无感透传） ────────
 # 宿主只解析 enabled / markerOptIn / agentProfile / anthropicUpstream。
 # 其余字段原样放进 options，交给 @context-proxy/cost-guard。
-#
-# 当前扩展会用到的 options（缺省时的行为）：
-#   taskArchiveEnabled  省略 = true。每个新 user turn 多一次同步 gate LLM。
-#   judge.enabled       省略 = false。开启后需配 baseUrl；宿主负责 HTTP 调用。
-#   compress* / gate*   省略则回退到 analyze 模型。
-#   requestPrepare      CCR 压缩门面，与路由开关相互独立。
 costGuard:
   enabled: false
+  # eitherOrEnabled: false
   markerOptIn: false       # true = 仅 /{agent}/{spaceId}/cost-guard/... 走路由
   agentProfile: auto
   # anthropicUpstream:
   #   url: "https://anthropic-upstream.example.com"
+  #   # 发往该上游时强制覆盖的请求头（覆盖客户端同名头），只作用于目标地址
+  #   # 等于 url 的请求。例：copilot /v1/messages 只对 TClaude-code 的
+  #   # User-Agent 正确处理 glm/kimi/deepseek + tools，其他 UA 返回 500。
+  #   headers:
+  #     User-Agent: "TClaude-code/0.1.8"
   # analyzeModel: "deepseek-v4-flash"
   # analyzeUrl: "https://analyzer.example.com/v1/chat/completions"
   # analyzeApiKey: ""
@@ -174,6 +174,39 @@ costGuard:
   #   everyNToolTurns: 5
   #   latchTtlSeconds: 0
   #   latchMaxTurns: 0
+  #   agentTurnSync: true     # agent turn 同步等判定结果再写 effort
+  #   effort:
+  #     userTurn: max          # 新 user turn 固定档位
+  #     agentTurnFallback: max # 判定失败/超时时的档位
+  #     only: [kimi-k3, deepseek-v4.1-flash, glm-5.3, claude-opus-5]
+  # modelPool:               # 客户端请求 serviceName 时在池内选模型
+  #   enabled: false         # 关闭时 tdai-code-o5 自动替换为 claude-opus-5 走原路径
+  #   serviceName: tdai-code-o5
+  #   compress: false        # 池请求是否requestPrepare；只在 requestPrepare 开着时有意义
+  #   primary:               # 兜底/强制场景用主模型；url/apiKey 省略走默认上游
+  #     id: claude-opus-5
+  #     model: claude-opus-5
+  #     # protocolModels:      # 某协议下上游模型名不同时按协议覆盖 model
+  #     #   anthropic: claude-opus-5-1m
+  #     description: "最强，复杂任务"
+  #   candidates:
+  #     - id: glm-5.3
+  #       model: glm-5.3
+  #       description: ""
+  #     - id: kimi-k3
+  #       model: kimi-k3
+  #       description: ""
+  #     - id: deepseek-v4.1-flash
+  #       model: deepseek-v4.1-flash
+  #       protocols: [openai]  # 省略 = openai + anthropic
+  #       description: ""
+  #   analyzer:              # 池分析模型；字段省略回退 analyze*
+  #     # 收到最近 3 轮原始 messages + 客户端 tools，无系统提示词，按请求自身协议发送：
+  #     # OpenAI 请求发 /v1/chat/completions，Anthropic 请求发 /v1/messages。
+  #     # 回 {"model":"<id>","confidence":n}，可以直接作为响应体
+  #     model: "router"
+  #     url: "http://analyzer.example.com:8091"   # base 或任一协议的完整路径
+  #     timeoutMs: 30000
   # controlPlane:            # 此 block 存在即启用；关闭时请整段省略
   #   port: 18097
   # requestPrepare:
@@ -192,6 +225,10 @@ costGuard:
   #     schemaBlacklist: ["edit_file", "write_file", "create_file",
   #                       "str_replace_editor", "apply_diff", "replace_in_file"]
   #     enforceRequired: true
+  #     # 覆盖注入字段的 description，仅 enforceRequired: true 时生效；省略即用内置 prompt。
+  #     # schemaPrompt: "REQUIRED. ..."
+  #     # 覆盖分析模型兜底的 system prompt；须保留 [{"id": 0, "cfq": "..."}] 的输出格式要求。
+  #     # analyzePrompt: "You generate Context Focus Questions ..."
   #     maxLength: 200
   #     # 主模型漏填 CFQ 时，用一个便宜模型在响应侧补生成并写进同一份缓存，
   #     # 下一轮 backfill 照常命中。默认开启；显式 enabled: false 才关。
@@ -426,6 +463,15 @@ clickhouse:
   flushThreshold: 50                 # 缓冲区积累 N 条后立即 flush（0 = 禁止批量 flush）
   ttlDays: 30                        # 数据保留天数（0 = 不自动过期；启动时通过 CREATE TABLE TTL 生效）
 
+# ── 企业微信名称归属（可选）─────────────────────────────────────────────────
+# 启用后首次使用一个 API Key 时会通过客户端原生交互工具要求填写企业微信名称；
+# 未填写、无交互能力或 ClickHouse 不可用时请求会被拒绝。仅保存 SHA-256(API Key)，
+# 不会把明文 API Key 写进 ClickHouse、日志或进程缓存。
+wecomIdentity:
+  enabled: false
+  table: api_key_wecom_names
+  cacheTtlMs: 3600000                # 进程内正缓存 TTL（1 小时）
+  maxNameLength: 128
 
 # ── Auth 鉴权（user_key 校验 → user_id 解析） ─────────────────────────────────
 # 启用后 proxy 调用内核 POST /v3/meta/auth/verify 验证客户端 API Key。
@@ -519,6 +565,12 @@ creditPricing:
       cacheRead: 0.5493
       cacheWrite5m: 6.8668
       cacheWrite1h: 10.9869
+
+    # 模型池关闭时 tdai-code-o5 回退为 claude-opus-5，需要 modelName 为 claude-opus-5 的条目：
+    # - name: "claude-opus-5"
+    #   modelName: "claude-opus-5"
+    #   input: <price>
+    #   output: <price>
 
     - name: "deepseek-v4-pro"          # DeepSeek V4 Pro
       modelName: "DeepSeek V4 Pro"
@@ -700,6 +752,8 @@ tdai:
     l1Limit: 5              # L1 召回最大条数
     l2Limit: 3              # L2/L3 注入最大条数
     timeoutMs: 5000         # 单次内核调用超时（毫秒）
+  sessionTrace:
+    maxQueuedBytes: 1073741824  # 在途会话上传（/v3/session/add）合计字节上限，超出的轮次直接丢弃。默认 1 GiB
 
 
 # ── Skill / 内核 gateway 数据面 ──────────────────────────────────────────────
@@ -774,6 +828,77 @@ skillRuntime:
                                  #   true:  <skill_tools> 注入全部工具（含写操作 create/update/delete 等）
                                  #          /skill-bridge 放行写操作
 
+  # ── skill 召回决策：谁来决定「用不用 skill / 用哪个」 ────────────────────
+  #
+  # enabled: false (默认, 行为与改造前完全一致 = legacy):
+  #   注入 <available_skills> 目录 + <skill_tools> curl 说明,
+  #   由主模型自己判断, 再自己 curl skill_view 拿正文。
+  #
+  # enabled: true 且所引用的策略可用:
+  #   目录与工具说明**都不注入**。新用户轮次由 proxy 用 `strategy` (定义在顶层
+  #   `selection.strategies`) 从候选里选 0 或 1 个; 选中后 proxy 直接返回一次工具调用
+  #   (Bash / execute_command / bash / shell / exec_command, 按客户端 tools 自动选择),
+  #   客户端执行 curl /skill-bridge/v3/skill/raw 加载 (会弹权限确认)。结果进入客户端
+  #   历史: 不回补、当轮生效、前缀缓存稳定。
+  #   支持协议: Anthropic Messages (claude-code) / OpenAI Chat (codebuddy / opencode / dsh) /
+  #   OpenAI Responses (codex / workbuddy)。
+  #
+  # enabled: true 但策略不可用 (如未配 apiKey): 启动时告警并回退 legacy。
+  #
+  # 开启后的已知边界（切换前务必确认）:
+  #   - 主模型不再具备「自己检索团队 skill 库」的默认能力 (skill_search 不注入)
+  #   - 只加载 SKILL.md 正文; scripts/ 等附件不会自动下发
+  #   - 运行期单次失败 (超时/限流/无权限/版本不一致/正文超预算): 本轮不加载, 不回退 legacy
+  #   - 上游为原生 Anthropic/Bedrock/Vertex 且开启 thinking 时本轮跳过;
+  #     斜杠命令 / compact 摘要 / session-init 完成轮不触发
+  #   - 策略再次选中已加载或失败过的 skill 时跳过本轮, 不再加载或自动改选次优项
+  #   - 按客户端历史计数: 累计失败 2 次后停止; 最多加载 3 个; 客户端 compact 后计数可能丢失
+  #   - 加载的 skill 正文受 cost-guard 压缩保护; 不保证客户端自己的 compact 保留全文
+  #   - listing 路径依赖 /v3/skill/listing 返回 `candidates` 字段, Core 需同步升级
+  #
+  # 以下两段 selection 样例默认都注释, 未配置时 enabled=false, 保持 legacy。
+  # 启用时: 取消本段和下方顶层 selection 的注释, 设置模型/服务 ID, 配置环境变量,
+  # 确保 injection.enabled=true、injectors 包含 skill, externalGatewayUrl 可被客户端访问,
+  # 然后重启 proxy。不要恢复已移除的 delivery / reselectEachTurn 配置。
+  # selection:
+  #   enabled: true               # 仅取消注释后启用; 代码默认 false
+  #   strategy: jev               # 引用顶层 selection.strategies 下的策略
+  #   contextCharBudget: 6000      # 发给策略模型的对话上下文字符预算
+  #   contentCharBudget: 24000     # 加载 SKILL.md 正文的上限; 超限则不加载
+  #   maxCandidates: 20           # 默认最多 20 个; 要先召回 Top-5 则改为 5, 另加 none 选项
+  #   useConversationQuery: true  # 新用户轮次按对话 query 做 hybrid 召回, 工具结果续轮不触发
+
+# ── 通用选择策略（与资产无关，skill / 以后的 memory 等按名引用） ───────────
+# 每个策略 = 一个 decision provider + 选择参数; 策略名即 YAML key, 由
+# skillRuntime.selection.strategy 引用。`provider` 默认 jev (当前唯一内置实现)。
+# 接入其他 decision API: 在 src/decision/providers/<type>/ 实现 DecisionProvider,
+# 在 src/decision/registry.ts 注册, 然后在这里写 `provider: <type>` 即可, 无需改策略代码。
+# 非 jev provider 不继承 jev 的默认 endpoint/model, 也不读取 TYPESAFE_API_KEY;
+# 用 apiKeyEnv 指定它自己的环境变量。provider 私有参数放 options。
+# 本段是顶层配置, 不要嵌套在 skillRuntime.selection 中。
+# 以下使用 TokenHub 示例; 原生 Typesafe 可改用 https://api.typesafe.ai/v1/systemone
+# 并填写该服务支持的模型名。模型 ID 与 key 必须属于可访问的同一服务。
+# selection:
+#   strategies:
+#     jev:
+#       provider: jev               # decision provider 类型, 默认 jev
+#       endpoint: "https://tokenhub.tencentmaas.com/v1/systemone"
+#       # 解析优先级: TYPESAFE_API_KEY env > 这里 (支持 ${VAR}) > 空。
+#       # 空 → 引用它的资产回退 legacy（启动时告警）。不要写明文。
+#       apiKey: "${TYPESAFE_API_KEY}"
+#       model: "ep-YOUR-SERVICE-ID" # 替换为实际模型 / 服务 ID, 此处仅为占位符
+#       timeoutMs: 3000             # 在线路径单次调用超时
+#       minConfidence: 0            # 选中项置信度门槛 (0~1), 0 = 不设门槛
+#
+#   # 接入其他 decision API 的写法 (需先注册对应 provider; 引用时改
+#   # skillRuntime.selection.strategy: my-decision):
+#   #   my-decision:
+#   #     provider: my-decision-api      # 已在 src/decision/registry.ts 注册的类型
+#   #     endpoint: "https://decision.example.com/v1/decide"
+#   #     apiKeyEnv: <ENV_VAR_NAME>      # 存放 key 的环境变量名 (不是 key 本身)
+#   #     model: "decide-v1"
+#   #     timeoutMs: 3000
+#   #     options: {}                    # provider 私有参数
 
 # ── mem: 特殊命令 ──────────────────────────────────────────────────────────
 # 用户在对话框输入 mem:sync / mem:create-skill / mem:help 等命令时，

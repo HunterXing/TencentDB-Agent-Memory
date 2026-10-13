@@ -859,6 +859,129 @@ export function runMetadataStoreContract(
       });
     });
 
+    // ── UserSessionDefault (v3.3) ──────────────────────────────────────────
+
+    describe("UserSessionDefault", () => {
+      it("getUserSessionDefault 不存在时返回 null", async () => {
+        const found = await store.getUserSessionDefault("usr-nonexistent");
+        expect(found).toBeNull();
+      });
+
+      it("upsertUserSessionDefault 插入新行并可查回", async () => {
+        const user = await store.createUser(uniqueUserInput());
+        const row = await store.upsertUserSessionDefault({
+          user_id: user.user_id,
+          team_id: "team-abc",
+          agent_id: "agent-def",
+          task_id: "task-ghi",
+        });
+        expect(row).toMatchObject({
+          user_id: user.user_id,
+          team_id: "team-abc",
+          agent_id: "agent-def",
+          task_id: "task-ghi",
+        });
+        expect(row.created_at).toBeTruthy();
+        expect(row.updated_at).toBeTruthy();
+
+        const found = await store.getUserSessionDefault(user.user_id);
+        expect(found).toMatchObject({
+          user_id: user.user_id,
+          team_id: "team-abc",
+          agent_id: "agent-def",
+          task_id: "task-ghi",
+        });
+      });
+
+      it('upsertUserSessionDefault 支持 task_id 为字面量 "default"', async () => {
+        const user = await store.createUser(uniqueUserInput());
+        const row = await store.upsertUserSessionDefault({
+          user_id: user.user_id,
+          team_id: "team-abc",
+          agent_id: "agent-def",
+          task_id: "default",
+        });
+        expect(row.task_id).toBe("default");
+
+        const found = await store.getUserSessionDefault(user.user_id);
+        expect(found?.task_id).toBe("default");
+      });
+
+      it("upsertUserSessionDefault 第二次 upsert 为 update (覆盖, created_at 保留)", async () => {
+        const user = await store.createUser(uniqueUserInput());
+        const first = await store.upsertUserSessionDefault({
+          user_id: user.user_id,
+          team_id: "team-A",
+          agent_id: "agent-A",
+          task_id: "task-A",
+        });
+
+        // 小等待确保 updated_at 不同
+        await new Promise((r) => setTimeout(r, 10));
+
+        const second = await store.upsertUserSessionDefault({
+          user_id: user.user_id,
+          team_id: "team-B",
+          agent_id: "agent-B",
+          task_id: "default",
+        });
+
+        expect(second.user_id).toBe(user.user_id);
+        expect(second.team_id).toBe("team-B");
+        expect(second.agent_id).toBe("agent-B");
+        expect(second.task_id).toBe("default");
+        expect(second.created_at).toBe(first.created_at); // 保留原值
+        // updated_at 应被刷新(或至少 >= first.updated_at)
+        expect(new Date(second.updated_at).getTime()).toBeGreaterThanOrEqual(
+          new Date(first.updated_at).getTime(),
+        );
+
+        // 不能同时存在两条
+        const found = await store.getUserSessionDefault(user.user_id);
+        expect(found).toMatchObject({ team_id: "team-B", task_id: "default" });
+      });
+
+      it("deleteUserSessionDefault 存在时返回 1 并删除", async () => {
+        const user = await store.createUser(uniqueUserInput());
+        await store.upsertUserSessionDefault({
+          user_id: user.user_id,
+          team_id: "t",
+          agent_id: "a",
+          task_id: "default",
+        });
+        const n = await store.deleteUserSessionDefault(user.user_id);
+        expect(n).toBe(1);
+        const found = await store.getUserSessionDefault(user.user_id);
+        expect(found).toBeNull();
+      });
+
+      it("deleteUserSessionDefault 不存在时返回 0, 幂等", async () => {
+        const n = await store.deleteUserSessionDefault("usr-nonexistent");
+        expect(n).toBe(0);
+      });
+
+      it("多个用户的默认配置互不干扰", async () => {
+        const u1 = await store.createUser(uniqueUserInput());
+        const u2 = await store.createUser(uniqueUserInput());
+        await store.upsertUserSessionDefault({
+          user_id: u1.user_id, team_id: "t1", agent_id: "a1", task_id: "k1",
+        });
+        await store.upsertUserSessionDefault({
+          user_id: u2.user_id, team_id: "t2", agent_id: "a2", task_id: "default",
+        });
+        expect(await store.getUserSessionDefault(u1.user_id))
+          .toMatchObject({ team_id: "t1", task_id: "k1" });
+        expect(await store.getUserSessionDefault(u2.user_id))
+          .toMatchObject({ team_id: "t2", task_id: "default" });
+
+        // 删 u1 不影响 u2
+        await store.deleteUserSessionDefault(u1.user_id);
+        expect(await store.getUserSessionDefault(u1.user_id)).toBeNull();
+        expect(await store.getUserSessionDefault(u2.user_id))
+          .toMatchObject({ team_id: "t2" });
+      });
+    });
+
     // ── InstanceUpstreamConfig (v2 模型组) ─────────────────────────────────
 
     describe("InstanceUpstreamConfig v2 (model groups)", () => {

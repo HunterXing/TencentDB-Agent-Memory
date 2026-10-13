@@ -13,6 +13,11 @@
  */
 
 import { DuplicateUserKeyError, type IMetadataStore } from "../store/interface.js";
+// UserSessionDefaultService (v3.3): 值 import, 用于 MetadataService.userSessionDefault
+// 懒初始化。循环 import 风险: 该 service 回头 import MetadataError (值) + MetadataService
+// (类型), MetadataError 是本模块的 class, 顶层 class 声明在 import 之前已完成 hoisting,
+// 真实实例化只发生在 Router 调用时, 届时所有模块已完成初始化, 不会 ReferenceError。
+import { UserSessionDefaultService as UserSessionDefaultServiceCtor } from "./user-session-default-service.js";
 import {
   checkPermission,
   canBindAsset,
@@ -254,6 +259,7 @@ export class MetadataService {
   private readonly quota: MetadataQuotaLimits;
   private readonly memorySystemUser?: MemorySystemUserConfig;
   private _configParams?: import("./config-param-service.js").IConfigParamService;
+  private _userSessionDefault?: import("./user-session-default-service.js").IUserSessionDefaultService;
 
   /**
    * 进程内 LRU 缓存：已确认（在 store 里存在的） chat_memory 资产 id 集合。
@@ -304,6 +310,24 @@ export class MetadataService {
 
   setConfigParamService(svc: import("./config-param-service.js").IConfigParamService): void {
     this._configParams = svc;
+  }
+
+  // ── UserSessionDefault (v3.3) ──
+  //
+  // 用户级 session 默认 (team, agent, task) 三元组。
+  //
+  // 懒初始化: UserSessionDefaultService 自包含 (只依赖 store + 本 metaService),
+  // 不需要外部装配。首次访问 .userSessionDefault 时才创建 —— 避免构造期触发
+  // 循环 import 执行序问题 (该 service 内部 import { MetadataError } 回本模块)。
+  get userSessionDefault(): import("./user-session-default-service.js").IUserSessionDefaultService {
+    if (!this._userSessionDefault) {
+      this._userSessionDefault = new (UserSessionDefaultServiceCtor as unknown as new (
+        store: IMetadataStore, svc: MetadataService,
+      ) => import("./user-session-default-service.js").IUserSessionDefaultService)(
+        this.store, this,
+      );
+    }
+    return this._userSessionDefault;
   }
 
   /**

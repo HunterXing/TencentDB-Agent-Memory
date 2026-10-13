@@ -3,6 +3,7 @@
 import type { Context } from "hono";
 import { verifyUserKey } from "./auth.js";
 import { extractSpaceIdFromPath } from "./credit-reporter.js";
+import { poolServiceFor } from "./guard-adapter.js";
 import { extractBearerToken } from "./opik.js";
 import { normalizePublicModelName } from "./pricing.js";
 import type { CreditPricingConfig, ProxyConfig } from "./types.js";
@@ -22,13 +23,14 @@ export interface OpenAIModelsResponse {
 /**
  * Builds the public model catalog from pricing entries accepted by
  * `isModelInPricing`: only non-empty `modelName` values are client-facing.
+ * `extraIds` (the live model-pool service) are listed first.
  */
-export function buildModelsResponse(pricing: CreditPricingConfig): OpenAIModelsResponse {
+export function buildModelsResponse(pricing: CreditPricingConfig, extraIds: string[] = []): OpenAIModelsResponse {
   const ids = new Set<string>();
   const data: OpenAIModel[] = [];
 
-  for (const entry of pricing.models ?? []) {
-    const id = entry.modelName?.trim() ?? "";
+  for (const rawId of [...extraIds, ...(pricing.models ?? []).map((entry) => entry.modelName)]) {
+    const id = rawId?.trim() ?? "";
     const normalizedId = normalizePublicModelName(id);
     if (!normalizedId || ids.has(normalizedId)) continue;
 
@@ -56,5 +58,6 @@ export async function handleModels(c: Context, config: ProxyConfig): Promise<Res
   }
 
   c.header("cache-control", "no-store");
-  return c.json(buildModelsResponse(config.creditPricing));
+  const pool = poolServiceFor(config);
+  return c.json(buildModelsResponse(config.creditPricing, pool.active ? [pool.serviceName] : []));
 }

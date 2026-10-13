@@ -504,22 +504,36 @@ export const enUS = {
   'code.register.gitUrl': 'Git URL',
   'code.register.gitUrlExtra':
     'After registration, it will automatically clone and build a code index.',
+  // Git URL placeholder switches by source (SSH source shows git@ form).
   'code.register.gitUrlPlaceholder': 'https://gitlab.example.com/namespace/repo.git',
+  'code.register.gitUrlPlaceholderSsh': 'git@github.com:namespace/repo.git or ssh://git@host:2222/namespace/repo.git',
   'code.register.branch': 'Branch',
-  'code.register.sshWarning':
-    'SSH format repository URLs are not supported in this version. Please use HTTPS format (e.g. https://gitlab.example.com/namespace/repo.git).',
+  'code.register.sshHint':
+    'Detected an SSH repository. Clicking Register will first generate an SSH public key for you; add it to your git platform before continuing.',
   'code.register.urlError':
-    'Please enter a valid HTTP(S) Git repository URL ending with .git (e.g. https://gitlab.example.com/namespace/repo.git). No spaces allowed.',
+    'Please enter a valid Git repository URL (HTTPS or SSH) ending with .git. No spaces allowed.',
   'code.register.invalidUrl':
-    'Please enter a valid HTTPS Git repository URL ending with .git (e.g. https://gitlab.example.com/namespace/repo.git). No spaces allowed.',
+    'Please enter a valid Git repository URL: HTTPS like https://gitlab.example.com/namespace/repo.git, or SSH like git@github.com:namespace/repo.git / ssh://git@host:2222/namespace/repo.git.',
   'code.register.submitting': 'Registering…',
   'code.register.submit': 'Register',
   'code.register.source': 'Source',
   'code.register.sourceExtra':
     'For private repos, pick a source and provide an access token. Leave as Public for open repos.',
+  'code.register.sourceSshExtra': 'SSH repos need no token; they are cloned with the SSH key of your account.',
   'code.register.sourcePublic': 'Public (no token)',
   // Source display names keyed by source id; backend display_name (if any) takes precedence.
   'code.source.gongfeng': 'Tencent Gongfeng',
+  'code.source.ssh': 'SSH',
+  // SSH public key (step 1 of the two-step registration)
+  'code.sshKey.caption': 'Configure SSH public key',
+  'code.sshKey.publicKey': 'SSH public key',
+  'code.sshKey.copy': 'Copy',
+  'code.sshKey.guideTitle': 'Complete the following steps:',
+  'code.sshKey.guideStep1': 'Copy the public key above;',
+  'code.sshKey.guideStep2': 'Add it on the SSH Keys settings page of your git platform;',
+  'code.sshKey.guideStep3': 'Once added, click "Configured, continue" at the bottom right.',
+  'code.sshKey.guideNote': 'Only one key is generated per account; later SSH repos reuse it — no need to configure again.',
+  'code.sshKey.continue': 'Configured, continue',
   'code.register.token': 'Access token',
   // Credential fields, keyed by form_field.name
   'code.credField.secret.label': 'Access token',

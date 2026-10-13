@@ -264,7 +264,8 @@ export function resolveCostGuardMode(requestPath: string): CostGuardMode {
  * 请求是否走遗留的 `/proxy/{spaceId}` 前缀。
  *
  * 该前缀不带 agent 信息，`agentSource` 只能兜底成 `claude-code`，据此解析出的
- * 会话身份与消息结构对其它客户端并不成立。因此这条入口只承担路由、压缩与计费，
+ * 会话身份与消息结构对其它客户端并不成立。因此这条入口只承担路由、压缩、计费与
+ * 会话上传（session-trace，不区分 subagent，全部记为主线），
  * 记忆类功能（session-init / mem 命令 / injection / L0 / skill）一律关闭——
  * 宁可不注入，也不要按错误的 agent 画像往用户上下文里塞东西。
  */

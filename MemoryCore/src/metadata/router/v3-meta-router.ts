@@ -343,6 +343,32 @@ const routeTable: Record<string, Handler> = {
     return s.configParams.setUserConfigForCaller(d);
   }),
 
+  // UserSessionDefault (v3.3) — 用户级 session 默认 (team, agent, task) 三元组
+  //
+  // 鉴权: service 层做 assertCallerIsOwner, 这里不重复; 实体校验 (team/agent/task
+  // 存在 + 归属 + 可见性) 也在 service 层 (保证"组合原子性"), router 不拆。
+  [`${V3_PREFIX}/user-session-default/get`]: bind(
+    S.userSessionDefaultGetSchema,
+    async (d, c, s) => {
+      await requireEntity(s, EntityType.User, d.user_id);
+      return s.userSessionDefault.get(c.userId!, d.user_id);
+    },
+  ),
+  [`${V3_PREFIX}/user-session-default/set`]: bind(
+    S.userSessionDefaultSetSchema,
+    async (d, c, s) => {
+      await requireEntity(s, EntityType.User, d.user_id);
+      return s.userSessionDefault.set(c.userId!, d);
+    },
+  ),
+  [`${V3_PREFIX}/user-session-default/delete`]: bind(
+    S.userSessionDefaultDeleteSchema,
+    async (d, c, s) => {
+      await requireEntity(s, EntityType.User, d.user_id);
+      return s.userSessionDefault.delete(c.userId!, d.user_id);
+    },
+  ),
+
   // InstanceUpstreamConfig v2 (see docs/design/2026-08-25-instance-upstream-config.md §6)
   //
   // 依赖 deps.getSupportedAgents():从 Core gateway config 里读 upstream.supportedAgents。
@@ -421,6 +447,9 @@ function mapErrorCode(code: string): number {
     case "permission_denied":
     case "agent_team_mismatch":
     case "task_agent_not_linked":
+    // UserSessionDefault (v3.3)
+    case "user_not_in_team":
+    case "agent_not_accessible":
       return 403;
     case "asset_not_bindable":
     case "duplicate_entry":

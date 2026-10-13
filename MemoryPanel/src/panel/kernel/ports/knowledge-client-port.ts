@@ -171,11 +171,24 @@ export interface SourceProviderFormField {
 
 export interface SourceProviderMeta {
   id: string;
-  /** 认证方式类型（bearer / basic / ...），前端据此可做 i18n 差异化提示。 */
-  auth_method: "bearer" | "basic";
+  /**
+   * 认证方式类型，前端据此可做 i18n 差异化提示。
+   * `ssh-key` → form_fields 为空数组，前端据此不渲染任何输入框。
+   */
+  auth_method: "bearer" | "basic" | "ssh-key";
   /** 表单字段清单，前端按此动态渲染凭据 input。 */
   form_fields: readonly SourceProviderFormField[];
   token_doc_url?: string | null;
+}
+
+// ── SSH 密钥（每用户一对；SSH 仓库 clone 用）──
+
+export interface SshKeyInfo {
+  /** 公钥内容（`ssh-rsa AAAA...`）—— KS 只回这一个字段，私钥永不出 KS。 */
+  public_key: string;
+  /** true = 本次新生成；false = 复用既有密钥。 */
+  created: boolean;
+  username: string;
 }
 
 export interface SourceProviderList {
@@ -286,6 +299,14 @@ export interface KnowledgeClientPort {
   codeGraphDelete(codeGraphIds: string[]): Promise<BatchDeleteResult>;
   codeGraphUpdateMeta(codeGraphId: string, patch: { repo_name?: string; summary?: string | null }): Promise<CodeGraphDetail>;
   codeGraphQuery(codeGraphId: string, tool: string, params: Record<string, unknown>): Promise<CodeGraphToolResult>;
+
+  /**
+   * 取（必要时生成）该用户的 SSH 密钥对，只回公钥。
+   * 身份用 `actor.userId` —— 绝不接受前端传入的 user_id。
+   */
+  sshKeyEnsure(actor: { teamId: string; userId: string }): Promise<SshKeyInfo>;
+  /** 只读：取已存在的公钥；未生成时 KS 返回 404（由 runKs 转成错误）。 */
+  sshKeyGet(actor: { teamId: string; userId: string }): Promise<SshKeyInfo>;
 
   // 外部来源（凭据挂在资源上，按 resource_type + resource_id 定位；team 门控由 KS 校验）
   sourceProviderListCode(): Promise<SourceProviderList>;

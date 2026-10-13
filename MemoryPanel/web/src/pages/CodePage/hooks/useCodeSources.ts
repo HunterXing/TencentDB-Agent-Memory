@@ -12,7 +12,7 @@ import {
 import { useTeams, useAgents } from '@/services';
 import { readAuth } from '@/components/LoginGate';
 import { tea } from '@/lib/tea-bridge';
-import { isValidGitHttpUrl, formatRepoName, type ScopeTab, type StatusFilter, type SubView, type ViewMode } from '../constants/code-constants';
+import { isValidGitUrl, isSshGitUrl, formatRepoName, SSH_SOURCE_ID, type ScopeTab, type StatusFilter, type SubView, type ViewMode } from '../constants/code-constants';
 
 export function useCodeSources() {
   const { t } = useTranslation();
@@ -46,6 +46,10 @@ export function useCodeSources() {
   const [formCredential, setFormCredential] = useState<Record<string, string>>({});
   const setCredentialField = (name: string, value: string) =>
     setFormCredential((prev) => ({ ...prev, [name]: value }));
+
+  // SSH 两段式注册：第 1 段拿到的公钥 + 是否展示公钥弹窗
+  const [sshPublicKey, setSshPublicKey] = useState('');
+  const [showSshKey, setShowSshKey] = useState(false);
 
   // Allocate-to-agent dialog state
   const [allocateTarget, setAllocateTarget] = useState<{
@@ -295,6 +299,9 @@ export function useCodeSources() {
    */
   const openRegister = useCallback(async () => {
     setShowRegister(true);
+    // 每次打开注册弹窗都清掉上一次的 SSH 公钥态，避免残留旧公钥误导用户。
+    setShowSshKey(false);
+    setSshPublicKey('');
     if (!activeTeamId) return;
     try {
       const providers = await knowledgeApi.source.providers(activeTeamId);
@@ -304,16 +311,42 @@ export function useCodeSources() {
     }
   }, [activeTeamId]);
 
-  const handleRegister = async () => {
+  /**
+   * 注册 = 两段式（仅 SSH 仓库需要两段）：
+   *
+   *   第 1 段 ensureSshKey：向后端取（必要时生成）该用户的公钥，弹窗展示给用户，
+   *                        用户去 Git 平台配好后再进入第 2 段。
+   *   第 2 段 submitCreate：真正 create 建图。
+   *
+   * 这样设计的原因：若一步到位直接 create，用户此刻还没配公钥，
+   * clone 必定失败并在列表里留一条 failed 记录，体验很差。
+   */
+  const ensureSshKey = async (): Promise<void> => {
+    if (!activeTeamId) return;
+    setSubmitting(true);
+    try {
+      const info = await knowledgeApi.code.sshKeyEnsure(activeTeamId);
+      setSshPublicKey(info.public_key);
+      setShowSshKey(true);
+    } catch (e: unknown) {
+      tea.notify.error(e);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const submitCreate = async (): Promise<void> => {
     const repo = formRepo.trim();
     if (!repo || !formBranch.trim() || !activeTeamId) return;
-    if (!isValidGitHttpUrl(repo)) {
+    if (!isValidGitUrl(repo)) {
       tea.notify.error(t('code.register.invalidUrl'));
       return;
     }
-    // 私有仓：按 provider.form_fields 校验必填字段
+    const isSsh = isSshGitUrl(repo);
+    // 私有仓（HTTPS 平台）：按 provider.form_fields 校验必填字段。
+    // SSH 来源 form_fields 为空数组 → 天然跳过令牌校验。
     const provider = sourceProviders.find((p) => p.id === formSourceType);
-    if (provider) {
+    if (provider && !isSsh) {
       for (const f of provider.form_fields) {
         if (f.required && !(formCredential[f.name] ?? '').trim()) {
           tea.notify.error(t('code.register.tokenRequired'));
@@ -325,6 +358,7 @@ export function useCodeSources() {
     try {
       // 私有仓：create 时把凭据一并传过去，KS 在入队建图前先落凭据，
       // 避免「create 立即 clone、凭据尚未写入」的时序窗口（否则私有仓必 401）。
+      // SSH 来源不传 secret（后端对该 provider 也不要求），只传 provider_id 表明走 SSH。
       const secret = (formCredential.secret ?? '').trim();
       const username = (formCredential.username ?? '').trim();
       const detail = await knowledgeApi.code.create({
@@ -332,16 +366,20 @@ export function useCodeSources() {
         repoUrl: repo,
         branch: formBranch.trim(),
         repoName: repo,
-        ...(provider && secret
-          ? {
-              providerId: formSourceType,
-              secret,
-              ...(username ? { username } : {}),
-            }
-          : {}),
+        ...(isSsh
+          ? { providerId: SSH_SOURCE_ID }
+          : provider && secret
+            ? {
+                providerId: formSourceType,
+                secret,
+                ...(username ? { username } : {}),
+              }
+            : {}),
       });
 
       setShowRegister(false);
+      setShowSshKey(false);
+      setSshPublicKey('');
       setFormRepo('');
       setFormBranch('main');
       setFormSourceType('');
@@ -358,6 +396,21 @@ export function useCodeSources() {
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const handleRegister = async () => {
+    const repo = formRepo.trim();
+    if (!repo || !formBranch.trim() || !activeTeamId) return;
+    if (!isValidGitUrl(repo)) {
+      tea.notify.error(t('code.register.invalidUrl'));
+      return;
+    }
+    // SSH 仓库：先取公钥给用户去平台配置，用户点「已配置，继续」后才真正建图。
+    if (isSshGitUrl(repo)) {
+      await ensureSshKey();
+      return;
+    }
+    await submitCreate();
   };
 
   const handleSync = async (cgId: string) => {
@@ -490,6 +543,12 @@ export function useCodeSources() {
     setCredentialField,
     setFormCredential,
     openRegister,
+    // SSH 两段式
+    sshPublicKey,
+    setSshPublicKey,
+    showSshKey,
+    setShowSshKey,
+    submitCreate,
     // allocate
     allocateTarget,
     setAllocateTarget,

@@ -148,11 +148,23 @@ export interface SourceProviderFormField {
 
 export interface SourceProviderMeta {
   id: string;
-  /** 认证方式类型（bearer / basic / ...）。 */
-  auth_method: 'bearer' | 'basic';
+  /**
+   * 认证方式类型（bearer / basic / ssh-key）。
+   * `ssh-key` 时 form_fields 为空数组 —— 前端据此不渲染任何输入框，
+   * 改为走「获取并配置 SSH 公钥」流程。
+   */
+  auth_method: 'bearer' | 'basic' | 'ssh-key';
   /** 表单字段清单：前端按此动态渲染。 */
   form_fields: readonly SourceProviderFormField[];
   token_doc_url?: string | null;
+}
+
+/** SSH 密钥信息（服务端只回公钥，私钥永不出服务端）。 */
+export interface SshKeyInfo {
+  public_key: string;
+  /** true = 本次新生成；false = 复用既有密钥。 */
+  created: boolean;
+  username: string;
 }
 
 /** wiki 远端节点（扁平，含目录节点）。 */
@@ -618,6 +630,17 @@ export const knowledgeApi = {
     /** 详情（用于 sync 后轮询） */
     get: (codeGraphId: string): Promise<CodeGraphDetail> =>
       panelPost('/code-graph/get', { code_graph_id: codeGraphId }),
+
+    /**
+     * SSH 公钥：取（必要时生成）。用户身份由后端从会话取，前端不传 user_id。
+     * 注意顺序：注册 SSH 仓库前先调它拿到公钥 → 用户去平台配置 → 再调 create。
+     */
+    sshKeyEnsure: (teamId: string): Promise<SshKeyInfo> =>
+      panelPost('/code-graph/ssh-key/ensure', { team_id: teamId }),
+
+    /** SSH 公钥：只读取回已存在的（不生成）。未生成时后端返回错误。 */
+    sshKeyGet: (teamId: string): Promise<SshKeyInfo> =>
+      panelPost('/code-graph/ssh-key/get', { team_id: teamId }),
 
     allocate: (teamId: string, codeGraphId: string, agentId: string): Promise<void> =>
       allocateKnowledge(teamId, codeGraphId, agentId),

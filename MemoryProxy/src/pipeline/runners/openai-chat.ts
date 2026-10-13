@@ -3,6 +3,8 @@
 import type { Context } from "hono";
 import { createHash } from "node:crypto";
 import { writeLog, createPipeline } from "../../logger.js";
+import { applyMainModel } from "../../mainModel.js";
+import { applyPoolService } from "../../pool-service.js";
 import {
   apiKeyToKeyId,
   extractBearerToken,
@@ -56,6 +58,7 @@ import { stageModelGate, buildUnregisteredModelErrorBody } from "../stages/model
 import { stageCredit } from "../stages/credit.js";
 import { stageSystemUser } from "../stages/system-user.js";
 import { stageBuildLangfuseTurnContext, stageReportAnalyzerTrace } from "../stages/observability.js";
+import { stageResolveTurnSeq } from "../stages/turn-seq.js";
 import { stageSessionResetPreHook } from "../stages/session-reset-pre-hook.js";
 import { stageSessionResetConfirmation } from "../stages/session-reset-confirmation.js";
 import { stageMemCommandIntercept } from "../stages/mem-command-intercept.js";
@@ -78,12 +81,22 @@ import { stageForwardWithRetry } from "../stages/forward-with-retry.js";
 import { resolveAgentStrategy } from "../strategies/agent/index.js";
 import { matchSystemUserByUserId, hasSystemUsers } from "../../systemUser.js";
 import { handleSystemUserPassthrough } from "../../systemUserPassthrough.js";
+import { requireWecomIdentity } from "../../wecom-identity-form.js";
 import { TdaiClient, buildTdaiClientForRequest } from "../../tdai/client.js";
 import { deriveTdaiIdentity } from "../../tdai/identity.js";
 import { extractLatestUserMessage, recordTdaiTurn } from "../../tdai/recorder.js";
 import { opencodeAdapter } from "../../agent-adapters/opencode.js";
 import { trackWrite, withL0Retry } from "../../tdai/pending-writes.js";
 import type { TdaiIdentity, TdaiMessage } from "../../tdai/types.js";
+import {
+  OpenAIChatAssembler,
+  buildSessionTurnContext,
+  createSessionTurnSeed,
+  openaiReplyFromJson,
+  parseSseData,
+  submitSessionTurn,
+  type SessionTurnContext,
+} from "../../session-trace/index.js";
 import { triggerSkillExtractIfReady } from "../../skill/handler-glue.js";
 import { emitModelIntentTelemetry } from "../../session/model-intent-telemetry.js";
 import { isExtractionAllowed, logExtractionSkipped } from "../../extraction-gate.js";
@@ -400,6 +413,9 @@ export async function runOpenaiChatPipeline(
   }
   // eslint-disable-next-line prefer-const
   let body = parseResult.body;
+  const poolService = applyPoolService(config, body);
+  if (poolService.clientFacingModel) c.set("clientFacingModel", poolService.clientFacingModel);
+  const mainModelFrom = poolService.routed ? null : applyMainModel(body);
 
   // ── DEBUG: dump tools/instructions/metadata（Phase 1 workbuddy 调研）──
   // 仅在 sessionInit.debugVerboseLogging=true 时启用，生产环境默认关闭。
@@ -527,7 +543,10 @@ export async function runOpenaiChatPipeline(
   // ── Model gate + alias (gated by stageGates.modelGate) ────────────────
   // 未开门控 → 完全跳过 pricing 检查, alias 也不做 (行为等价 codex/wb minimal preset)。
   let modelId: string;
-  if (_gates.modelGate) {
+  if (poolService.routed) {
+    // The pool primary is an upstream id, not a pricing entry; the router re-targets it.
+    modelId = requestedModel;
+  } else if (_gates.modelGate) {
     const gateResult = stageModelGate(requestedModel, config, _isCustomUpstream);
     if (!gateResult.ok) {
       return c.json(buildUnregisteredModelErrorBody(requestedModel), 400);
@@ -595,6 +614,12 @@ export async function runOpenaiChatPipeline(
   const authHeader = c.req.header("authorization") ?? c.req.header("Authorization") ?? "";
   const apiKey = extractBearerToken(authHeader);
   let keyId = apiKey ? apiKeyToKeyId(apiKey) : "unknown";
+  let wecomName = "";
+  if (agentFromPath) {
+    const wecomIdentity = await requireWecomIdentity(config, apiKey, body, "openai");
+    if (wecomIdentity.kind !== "resolved") return wecomIdentity.response;
+    wecomName = wecomIdentity.name;
+  }
 
   // ── Lowercased headers for agent profile detection + session key ──────────
   const lcHeaders: Record<string, string> = {};
@@ -637,6 +662,16 @@ export async function runOpenaiChatPipeline(
     const _reason = _legacyProxy ? "legacy /proxy prefix" : "auxiliary";
     console.log(`[request-classify] session=${sessionKey} agent=${agentSource} → ${_reason} (skip session-init/mem/injection/L0/skill)`);
   }
+
+  const sessionTurnSeed = createSessionTurnSeed(config, {
+    agent: agentSource,
+    path: c.req.path,
+    protocol: "openai",
+    headers: lcHeaders,
+    body,
+    sessionId: sessionKey,
+    startedAt: startTime,
+  });
 
   // ── dsh (deepseek-harness) CLI headless / no-preset bypass ──────────────
   // dsh 客户端在 headless bundle 或未挂 ask-user preset 时,body.tools 里
@@ -893,6 +928,20 @@ export async function runOpenaiChatPipeline(
   // LLM 幻觉出来的"帮助文本"（含 mem:atoms/mem:profile/mem:conversations 等
   // 根本不存在的命令）。本次抓包 (langfuse trace d814929a...) 实证后补齐。
   //
+  // ── Langfuse trace 对齐: 本 turn 的权威 turnSeq ─────────────────────────
+  // 跟 anthropic runner 做法一致, 先算一次, 下面三处 observation 入口
+  // (mem-command intercept / injection pipeline / stageBuildLangfuseTurnContext)
+  // 都用同一个值, 保证一个 turn 的所有 observation 挂到同一条 Langfuse trace。
+  // openai-chat 没有 CC 的 fork/sidequery 分流概念, lane 走默认 "main"。
+  //
+  // Redis gate: 只在 Redis 开启时走新路径, 未开启时 undefined 透传 →
+  // 老行为完全不变 (向后兼容, 不触碰 cost-guard target.turnSeq 优先级)。
+  const resolvedTurnSeq = config.redis?.enabled
+    ? await stageResolveTurnSeq({
+        config, sessionKey, messages, protocol: "openai",
+      })
+    : undefined;
+
   // 请求分类：OpenAI 协议不做 CC 的 fork/sidequery 分流（handler.ts 没接 CC
   // routing），所有请求都视为 main —— 与 codebuddy adapter classifyRequest 一致。
   // ── mem: command intercept (via shared stage) ────────────────────────
@@ -916,6 +965,10 @@ export async function runOpenaiChatPipeline(
       assistantContentFormat: "openai-string",
       startTime, keyId, assetCapabilities,
       upstreamProtocol: "openai",
+      // 权威 turnSeq (与 injection / lf 构造共用) — mem-command span 挂同一
+      // Langfuse trace, 治理前走 inline countHumanTurns fallback 在 compaction
+      // 场景会漂移。
+      preResolvedTurnSeq: resolvedTurnSeq,
     });
     if (memResp) return memResp;
   }
@@ -952,6 +1005,11 @@ export async function runOpenaiChatPipeline(
       sessionInfo: sessionInfo as Record<string, unknown> | null | undefined,
       assetCapabilities,
       callerUserKey: apiKey,
+      // 权威 turnSeq (与 mem-command / lf 构造共用) — 让
+      // LangfuseInjectionObserver 创建的 injection span 挂在 LLM generation
+      // 同一条 Langfuse trace 下。治理前走 stateless countHumanTurns, 和 lf
+      // 的 resolveMonotonicTurnSeq 在 compaction 场景会分家。
+      turnSeqOverride: resolvedTurnSeq,
     });
     body = injected.body;
     messages = injected.messages;
@@ -969,6 +1027,8 @@ export async function runOpenaiChatPipeline(
     keyId, sessionKey, messages, hasTools, body,
     modelId: modelId as string, headers: lcHeaders,
     traceId, startTime, spaceId,
+    ...(mainModelFrom !== null ? { requestedModel: mainModelFrom } : {}),
+    modelPool: poolService.routed,
   });
   const target = resolvedTarget.target;
   let effectiveApiKey = resolvedTarget.effectiveApiKey;
@@ -993,6 +1053,27 @@ export async function runOpenaiChatPipeline(
     }
   }
   const skipCreditReport = overrideResult.skipCreditReport;
+
+  // ── Skill selection (proxy 选择 → 客户端加载) ─────────────────────────────
+  // 与 anthropicHandler 对称：新用户轮次选中 skill → 直接返回 tool_calls，由客户端
+  // 执行加载。session-init 刚完成的这一轮不触发（避免与表单伪造响应叠加）。
+  if (!isAuxiliary && !_dshHeadless && !injectedSkipped && !sessionJustRegistered && sessionInfo && conversationId) {
+    const { tryClientToolDelivery } = await import("../../skill/selection/delivery/client-tool.js");
+    const resp = await tryClientToolDelivery(config, {
+      protocol: "openai",
+      body,
+      messages,
+      upstreamUrl: target.url,
+      stream: isStream,
+      model: String(modelId ?? ""),
+      session: sessionInfo as Parameters<typeof tryClientToolDelivery>[1]["session"],
+      conversationId,
+      sessionKey,
+      agentSource,
+      skillCapability: assetCapabilities?.skill !== false,
+    });
+    if (resp) return resp;
+  }
 
   // ── Create pipeline logger ──────────────────────────────────────────────
   const pipe = createPipeline(config, traceId, target.model);
@@ -1022,10 +1103,15 @@ export async function runOpenaiChatPipeline(
   // ── Turn context 装配 via shared stageBuildLangfuseTurnContext ──
   // 58e4c55b opencode fix: opencode 的 userQuery 由 caller 算好后覆写, 不走
   // stage 内默认 resolveLatestUserQuery (见上方 opencodeUserQuery 计算与注释)。
+  // preResolvedTurnSeq=resolvedTurnSeq: 复用入口已算的权威 turnSeq, 跳过
+  // 本 stage 内重复的 countHumanTurns + Redis Lua, 保证 LLM generation 挂
+  // 到跟上面 injection / mem-command 同一条 Langfuse trace。
   const { turnSeq, lf } = await stageBuildLangfuseTurnContext({
     config, sessionKey, keyId, target, messages, protocol: "openai",
-    traceTags, path: c.req.path, headers: lcHeaders, body,
+    traceTags, path: c.req.path, headers: lcHeaders, body, spaceId,
     userQueryOverride: opencodeUserQuery,
+    wecomName,
+    preResolvedTurnSeq: resolvedTurnSeq,
   });
   stageReportAnalyzerTrace({ config, target, traceId, lf, keyId, sessionKey, turnSeq, startTime, spaceId });
 
@@ -1049,8 +1135,8 @@ export async function runOpenaiChatPipeline(
   // ── Opik: create trace (gated by stageGates.opik) ─────────────────────
   const forkTraceId = _gates.opik ? opikCreateTrace(config, {
     traceId,
-    projectName: keyId,
-    name: `${target.model} / ${keyId}`,
+    projectName: wecomName || keyId,
+    name: `${target.model} / ${wecomName || keyId}`,
     startTime,
     input: { messages: flattenMessagesForOpik(messages) },
     tags: [...traceTags, ...target.tags],
@@ -1091,11 +1177,17 @@ export async function runOpenaiChatPipeline(
     spaceId,
     lf,
     opikTraceId: traceId,
-    opikKeyId: keyId,
-    skipPrepare: costGuardMode === "cheap",
+    opikKeyId: wecomName || keyId,
+    skipPrepare: costGuardMode === "cheap" || target.skipPrepare === true,
   });
 
   const upstreamBody = buildUpstreamBody(body, target);
+  const sessionTurnCtx = buildSessionTurnContext(config, sessionTurnSeed, {
+    spaceId,
+    sessionInfo,
+    authUserId: userId,
+    upstreamBody,
+  });
   // Retry headers: preserve original client headers (x-request-id, user-agent,
   // etc.), then force the primary upstream's auth — retry always goes to the
   // default upstream (never the alternate route), so its apiKey must be applied
@@ -1236,6 +1328,7 @@ export async function runOpenaiChatPipeline(
       config,
       modelId: effectiveModel,
       keyId,
+      obsProjectName: wecomName || keyId,
       sessionKey,
       upstreamUrl: target.url,
       requestPath: c.req.path,
@@ -1265,6 +1358,7 @@ export async function runOpenaiChatPipeline(
       skipCreditReport,
       isCustomUpstream: _isCustomUpstream,
       gates: _gates,
+      sessionTurnCtx: upstreamResp.ok ? sessionTurnCtx : null,
     };
     const passthrough = createUsageTapTransform(tapCtx);
     // 顺序要紧：tap 在前，读到的是模型原始输出；剥离在后，只影响客户端那一份。
@@ -1296,6 +1390,9 @@ export async function runOpenaiChatPipeline(
       if (msg && typeof msg === "object") {
         assistantMessage = msg as Record<string, unknown>;
       }
+    }
+    if (upstreamResp.ok) {
+      submitSessionTurn(sessionTurnCtx, openaiReplyFromJson(respJson), effectiveModel || requestedModel);
     }
   } catch {
     // non-JSON upstream response
@@ -1398,7 +1495,7 @@ export async function runOpenaiChatPipeline(
     if (_gates.opik) {
       opikUpdateTrace(config, {
         traceId,
-        projectName: keyId,
+        projectName: wecomName || keyId,
         endTime,
         output: outputMessages,
         usage,
@@ -1420,7 +1517,7 @@ export async function runOpenaiChatPipeline(
     if (_gates.opik) {
       opikCreateLlmSpan(config, {
         traceId,
-        projectName: keyId,
+        projectName: wecomName || keyId,
         name: effectiveModel,
         startTime,
         endTime,
@@ -1467,6 +1564,7 @@ export async function runOpenaiChatPipeline(
       traceName: lf.traceName,
       userId: lf.userId,
       sessionId: lf.sessionId,
+      instanceId: lf.instanceId,
       tags: lf.tags,
       traceInput: lf.userQuery || undefined,
       traceOutput: assistantMessage ?? undefined,
@@ -1572,6 +1670,8 @@ interface TapContext {
   config: ProxyConfig;
   modelId: string;
   keyId: string;
+  /** Opik project the turn trace was created in (`wecomName || keyId`). */
+  obsProjectName: string;
   sessionKey: string;
   upstreamUrl: string;
   traceId: string;
@@ -1618,6 +1718,8 @@ interface TapContext {
   isCustomUpstream?: boolean;
   /** stageGates — 决定 stream 尾部各 stage 是否触发 */
   gates?: import("../strategies/agent/types.js").StageGates;
+  /** Online session trace for this call; null when it is not recorded. */
+  sessionTurnCtx: SessionTurnContext | null;
 }
 
 /** Accumulated tool call state during SSE streaming. */
@@ -1704,6 +1806,7 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
   let lastUsage: Record<string, unknown> | null = null;
   let assistantContent = "";
   const toolCallAccumulators = new Map<number, ToolCallAccumulator>();
+  const replyAssembler = ctx.sessionTurnCtx ? new OpenAIChatAssembler() : null;
 
   function processSseChunk(chunk: string): void {
     sseBuf += chunk;
@@ -1715,6 +1818,7 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
       const { content, toolCallDeltas } = extractSseContentAndTools(part);
       assistantContent += content;
       mergeToolCallDeltas(toolCallAccumulators, toolCallDeltas);
+      if (replyAssembler) parseSseData(part).forEach((evt) => replyAssembler.push(evt));
     }
   }
 
@@ -1725,7 +1829,10 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
       const { content, toolCallDeltas } = extractSseContentAndTools(sseBuf);
       assistantContent += content;
       mergeToolCallDeltas(toolCallAccumulators, toolCallDeltas);
+      if (replyAssembler) parseSseData(sseBuf).forEach((evt) => replyAssembler.push(evt));
     }
+
+    if (replyAssembler) submitSessionTurn(ctx.sessionTurnCtx, replyAssembler.result(), modelId);
 
     const endTime = new Date().toISOString();
 
@@ -1801,7 +1908,7 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
       });
       stageOpikStreamSpan({
         config, gates: ctx.gates, pipe,
-        traceId, forkTraceId: ctx.forkTraceId, keyId, modelId,
+        traceId, forkTraceId: ctx.forkTraceId, keyId, projectName: ctx.obsProjectName, modelId,
         startTime, endTime, inputMessages, outputMessage,
         usage: lastUsage, retried, upstreamUrl,
         updateTrace: true, streamTag: "stream",
@@ -1831,6 +1938,7 @@ function createUsageTapTransform(ctx: TapContext): TransformStream<Uint8Array, U
         traceName: lf.traceName,
         userId: lf.userId,
         sessionId: lf.sessionId,
+        instanceId: lf.instanceId,
         tags: lf.tags,
         traceInput: lf.userQuery || undefined,
         traceOutput: outputMessage ?? undefined,

@@ -57,6 +57,8 @@ import type {
   ConfigParamEntity,
   UpsertConfigParamInput,
   ListConfigParamsFilter,
+  UserSessionDefaultEntity,
+  UpsertUserSessionDefaultInput,
   InstanceUpstreamConfigEntity,
   InstanceUpstreamConfigFilter,
   CreateInstanceUpstreamGroupInput,
@@ -319,6 +321,25 @@ export class SqliteMetadataStore implements IMetadataStore {
         ON meta_config_params(user_id, module, param_name) WHERE scope = 'user';
       CREATE INDEX IF NOT EXISTS idx_meta_config_params_module
         ON meta_config_params(module);
+
+      -- UserSessionDefault (v3.3): 用户级 session 默认 (team/agent/task) 三元组。
+      -- user_id PK 天然保证"至多一条"。task_id 存真实 id 或字面量 "default"
+      -- (与 Proxy sessionInit.defaultTaskId 契约一致, 见 types.ts::DEFAULT_TASK_SENTINEL)。
+      CREATE TABLE IF NOT EXISTS meta_user_session_defaults (
+        user_id    TEXT PRIMARY KEY,
+        team_id    TEXT NOT NULL,
+        agent_id   TEXT NOT NULL,
+        task_id    TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES meta_users(user_id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_meta_user_session_defaults_team
+        ON meta_user_session_defaults(team_id);
+      CREATE INDEX IF NOT EXISTS idx_meta_user_session_defaults_agent
+        ON meta_user_session_defaults(agent_id);
+      CREATE INDEX IF NOT EXISTS idx_meta_user_session_defaults_task
+        ON meta_user_session_defaults(task_id);
 
       -- v2 (模型组) 结构。v1 未真正投产,直接 DROP + 重建,不留兼容 shim。
       -- 详见 docs/design/2026-08-25-instance-upstream-config.md §5.1。
@@ -1897,6 +1918,78 @@ export class SqliteMetadataStore implements IMetadataStore {
       param_name: String(r.param_name),
       param_value: String(r.param_value),
       description: String(r.description),
+      created_at: String(r.created_at),
+      updated_at: String(r.updated_at),
+    };
+  }
+
+  // ============================================================
+  // UserSessionDefault (v3.3) — 用户级 (team, agent, task) 默认三元组
+  // ============================================================
+
+  getUserSessionDefault(userId: string): UserSessionDefaultEntity | null {
+    return this.mapUserSessionDefault(
+      this.get<Row>(
+        "SELECT * FROM meta_user_session_defaults WHERE user_id = ?",
+        userId,
+      ),
+    );
+  }
+
+  upsertUserSessionDefault(
+    input: UpsertUserSessionDefaultInput,
+  ): UserSessionDefaultEntity {
+    const now = nowIso();
+    // upsert 事务:若已存在,保留原 created_at,仅刷新 updated_at + 其他字段。
+    this.db.exec("BEGIN");
+    try {
+      const existing = this.get<Row>(
+        "SELECT created_at FROM meta_user_session_defaults WHERE user_id = ?",
+        input.user_id,
+      );
+      if (existing) {
+        this.run(
+          `UPDATE meta_user_session_defaults
+             SET team_id = ?, agent_id = ?, task_id = ?, updated_at = ?
+           WHERE user_id = ?`,
+          input.team_id, input.agent_id, input.task_id, now, input.user_id,
+        );
+      } else {
+        this.run(
+          `INSERT INTO meta_user_session_defaults
+             (user_id, team_id, agent_id, task_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          input.user_id, input.team_id, input.agent_id, input.task_id, now, now,
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+
+    const row = this.getUserSessionDefault(input.user_id);
+    if (!row) {
+      throw new Error("upsertUserSessionDefault: row disappeared after write");
+    }
+    return row;
+  }
+
+  deleteUserSessionDefault(userId: string): number {
+    const info = this.db
+      .prepare("DELETE FROM meta_user_session_defaults WHERE user_id = ?")
+      .run(userId);
+    return info.changes;
+  }
+
+  private mapUserSessionDefault(row: Row | null): UserSessionDefaultEntity | null {
+    if (!row) return null;
+    const r = row as Record<string, unknown>;
+    return {
+      user_id: String(r.user_id),
+      team_id: String(r.team_id),
+      agent_id: String(r.agent_id),
+      task_id: String(r.task_id),
       created_at: String(r.created_at),
       updated_at: String(r.updated_at),
     };

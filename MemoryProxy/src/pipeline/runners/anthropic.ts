@@ -10,6 +10,8 @@
 import type { Context } from "hono";
 import { createHash } from "node:crypto";
 import { writeLog, createPipeline } from "../../logger.js";
+import { applyMainModel } from "../../mainModel.js";
+import { applyPoolService } from "../../pool-service.js";
 import {
   apiKeyToKeyId,
   opikCreateLlmSpan,
@@ -67,11 +69,13 @@ import { stageSessionInitOrchestrate } from "../stages/session-init-orchestrate.
 import { stageCredit } from "../stages/credit.js";
 import { stageSystemUser } from "../stages/system-user.js";
 import { stageBuildLangfuseTurnContext, stageReportAnalyzerTrace } from "../stages/observability.js";
+import { requireWecomIdentity } from "../../wecom-identity-form.js";
 import { stageSessionResetPreHook } from "../stages/session-reset-pre-hook.js";
 import { stageResponseTailFix } from "../stages/response-tail-fix.js";
 import { stageSessionResetConfirmation } from "../stages/session-reset-confirmation.js";
 import { stageMemCommandIntercept } from "../stages/mem-command-intercept.js";
 import { stageInjectionRunner } from "../stages/injection-runner.js";
+import { stageResolveTurnSeq } from "../stages/turn-seq.js";
 import { stageInstanceUpstreamEarly } from "../stages/instance-upstream-early.js";
 import { stageInstanceUpstreamOverride } from "../stages/instance-upstream-override.js";
 import { stageResolveTargetFull } from "../stages/resolve-target-full.js";
@@ -83,6 +87,14 @@ import { TdaiClient, buildTdaiClientForRequest } from "../../tdai/client.js";
 import { deriveTdaiIdentity } from "../../tdai/identity.js";
 import { extractLatestUserMessage, recordTdaiTurn } from "../../tdai/recorder.js";
 import { trackWrite, withL0Retry } from "../../tdai/pending-writes.js";
+import {
+  AnthropicMessageAssembler,
+  anthropicReplyFromJson,
+  buildSessionTurnContext,
+  createSessionTurnSeed,
+  submitSessionTurn,
+  type SessionTurnContext,
+} from "../../session-trace/index.js";
 import type { TdaiIdentity, TdaiMessage } from "../../tdai/types.js";
 import { triggerSkillExtractIfReady } from "../../skill/handler-glue.js";
 import { emitModelIntentTelemetry } from "../../session/model-intent-telemetry.js";
@@ -340,11 +352,26 @@ function buildUpstreamBody(
 }
 
 /**
+ * `costGuard.anthropicUpstream.headers` when `url` targets that upstream
+ * (exact match or a sub-path of it), otherwise undefined.
+ */
+export function anthropicUpstreamHeaderOverrides(
+  config: ProxyConfig,
+  url: string | undefined,
+): Record<string, string> | undefined {
+  const upstream = config.costGuard.anthropicUpstream;
+  if (!upstream?.headers || !upstream.url || !url) return undefined;
+  const base = upstream.url.replace(/\/+$/, "");
+  const target = url.split("?")[0].replace(/\/+$/, "");
+  return target === base || target.startsWith(`${base}/`) ? upstream.headers : undefined;
+}
+
+/**
  * Build upstream headers from request headers + cost guard auth overrides.
  */
 function buildUpstreamHeaders(
   c: Context,
-  _config: ProxyConfig,
+  config: ProxyConfig,
   target: ForwardTarget,
   sessionKey?: string,
   effectiveApiKey?: string,
@@ -378,6 +405,7 @@ function buildUpstreamHeaders(
   if (sessionKey) {
     headers["x-vertex-ai-session-id"] = sessionKey;
   }
+  Object.assign(headers, anthropicUpstreamHeaderOverrides(config, target.url));
   return headers;
 }
 
@@ -472,6 +500,9 @@ export async function runAnthropicPipeline(
   }
   // eslint-disable-next-line prefer-const
   let body = parseResult.body;
+  const poolService = applyPoolService(config, body);
+  if (poolService.clientFacingModel) c.set("clientFacingModel", poolService.clientFacingModel);
+  const mainModelFrom = poolService.routed ? null : applyMainModel(body);
 
   // ── CC request classification (feature-gated, per-agent) ─────────────────
   // 通过 agentAdapter 分类请求 —— 每个客户端有自己的规则：
@@ -542,7 +573,10 @@ export async function runAnthropicPipeline(
   // 保证 upstream 收到规范 id;pricing 表未含时 modelId 回退 requestedModel。
   let modelId: string;
   let modelAliasApplied = false;
-  if (_gates.modelGate) {
+  if (poolService.routed) {
+    // The pool primary is an upstream id, not a pricing entry; the router re-targets it.
+    modelId = requestedModel;
+  } else if (_gates.modelGate) {
     const gateResult = stageModelGate(requestedModel, config, _isCustomUpstream);
     if (!gateResult.ok) {
       return c.json(
@@ -601,6 +635,12 @@ export async function runAnthropicPipeline(
   // ── Resolve apiKey → project name ──────────────────────────────────────
   const apiKey = extractApiKey(c);
   let keyId = apiKey ? apiKeyToKeyId(apiKey) : "unknown";
+  let wecomName = "";
+  if (agentFromPath) {
+    const wecomIdentity = await requireWecomIdentity(config, apiKey, body, "anthropic");
+    if (wecomIdentity.kind !== "resolved") return wecomIdentity.response;
+    wecomName = wecomIdentity.name;
+  }
 
   // ── Lowercased headers for agent profile detection + session key ──────────
   const lcHeaders: Record<string, string> = {};
@@ -623,6 +663,16 @@ export async function runAnthropicPipeline(
 
   // sk-mem key（用于 TDAI ACL / MetadataClient 的 x-tdai-user-key）就是入口的 apiKey。
   const callerUserKey = apiKey || null;
+
+  const sessionTurnSeed = createSessionTurnSeed(config, {
+    agent: agentSource,
+    path: c.req.path,
+    protocol: "anthropic",
+    headers: lcHeaders,
+    body,
+    sessionId: sessionKey,
+    startedAt: startTime,
+  });
 
   // Activate Redis storage early — must run BEFORE session init.
   if (config.redis?.enabled) {
@@ -834,6 +884,28 @@ export async function runAnthropicPipeline(
     return stageResponseTailFix(_resetConfirmResp, agentSource, isStream);
   }
 
+  // ── Langfuse trace 对齐: 本 turn 的权威 turnSeq ─────────────────────────
+  // 在 mem-command / injection 之前算一次, 下面三处 observation 入口
+  // (mem-command intercept / injection pipeline / stageBuildLangfuseTurnContext)
+  // 都用同一个值, 保证一个 turn 内所有 observation 挂到同一条 Langfuse trace。
+  // 治理前: injection 用 stateless countHumanTurns, lf 构造走
+  // resolveMonotonicTurnSeq, 开 Redis + compaction 场景下两者分家 →
+  // 本轮 injection span 挂到幽灵 trace。lane=requestKind 保留 CC 独有的
+  // main/fork/sidequery 分车道语义。
+  //
+  // Redis gate: 只在 Redis 开启时走新路径, 否则 undefined 透传给三 stage,
+  // 老行为完全不变 (向后兼容红线)。
+  //   - Redis 开启 + 无 compaction : Redis Lua 与现网 target.turnSeq 都是
+  //     proxy monotonic counter, 值等同, trace ID 空间几乎不变
+  //   - Redis 开启 + compaction    : 治 injection/mem-command 分家
+  //   - Redis 未开启               : 维持治理前 (countHumanTurns + target.turnSeq
+  //     优先), trace ID 空间字节级一致
+  const resolvedTurnSeq = config.redis?.enabled
+    ? await stageResolveTurnSeq({
+        config, sessionKey, messages, protocol: "anthropic", lane: requestKind,
+      })
+    : undefined;
+
   // ── mem: command intercept ────────────────────────────────────────────────
   // 在 session init 完成后、injection pipeline 之前检测。
   // 命中时：执行命令 → 写 L0 → 触发 skill extract → 伪造响应返回。
@@ -871,6 +943,10 @@ export async function runAnthropicPipeline(
       startTime, keyId, assetCapabilities,
       upstreamProtocol: "anthropic",
       thinking: !!body?.thinking,
+      // 权威 turnSeq (与 injection / lf 构造共用) — mem-command span 挂同一
+      // Langfuse trace, 治理前走 inline countHumanTurns fallback 在 compaction
+      // 场景会漂移。
+      preResolvedTurnSeq: resolvedTurnSeq,
     });
     if (memResp) return stageResponseTailFix(memResp, agentSource, isStream);
   }
@@ -905,6 +981,13 @@ export async function runAnthropicPipeline(
       assetCapabilities,
       callerUserKey: callerUserKey ?? undefined,
       readOnly: requestKind === "fork",
+      // 权威 turnSeq (与 mem-command / lf 构造共用) — 让
+      // LangfuseInjectionObserver 创建的 injection span 挂在
+      // LLM generation 同一条 Langfuse trace 下, UI 上点开主对话 trace
+      // 才能看到 skill / memory 注入段。治理前这里走 stateless
+      // countHumanTurns, 和 lf 的 resolveMonotonicTurnSeq 在 compaction
+      // 场景会分家。
+      turnSeqOverride: resolvedTurnSeq,
     });
     body = injected.body;
     messages = injected.messages;
@@ -922,6 +1005,8 @@ export async function runAnthropicPipeline(
     keyId, sessionKey, messages, hasTools, body,
     modelId: modelId as string, headers: lcHeaders,
     traceId, startTime, spaceId,
+    ...(mainModelFrom !== null ? { requestedModel: mainModelFrom } : {}),
+    modelPool: poolService.routed,
   });
   const target = resolvedTarget.target;
   let effectiveApiKey = resolvedTarget.effectiveApiKey;
@@ -945,6 +1030,30 @@ export async function runAnthropicPipeline(
     }
   }
   const skipCreditReport = overrideResult.skipCreditReport;
+
+  // ── Skill selection (proxy 选择 → 客户端加载) ─────────────────────────────
+  // 新用户轮次选中 skill → 不调用上游，直接返回一条 tool_use，由客户端执行加载；
+  // 结果进入客户端历史（不回补、当轮生效、缓存稳定）。必须在转发目标确定之后
+  // 判断：是否做 thinking 签名校验取决于实际上游。只作用于主对话。
+  // session-init 刚完成的这一轮（表单作答 / 消息被 init 改写）不触发，避免与表单
+  // 伪造响应叠加；下一轮用户提问再加载。
+  if (memoryTurn && !injectedSkipped && !sessionJustRegistered && sessionInfo && conversationId) {
+    const { tryClientToolDelivery } = await import("../../skill/selection/delivery/client-tool.js");
+    const resp = await tryClientToolDelivery(config, {
+      protocol: "anthropic",
+      body,
+      messages,
+      upstreamUrl: target.url,
+      stream: isStream,
+      model: String(modelId ?? ""),
+      session: sessionInfo as Parameters<typeof tryClientToolDelivery>[1]["session"],
+      conversationId,
+      sessionKey,
+      agentSource,
+      skillCapability: assetCapabilities?.skill !== false,
+    });
+    if (resp) return resp;
+  }
 
   // ── Create pipeline logger ──────────────────────────────────────────────
   const pipe = createPipeline(config, traceId, target.model);
@@ -980,9 +1089,15 @@ export async function runAnthropicPipeline(
   // shorter history, so each kind counts on its own lane.
   // ── Turn context 装配 via shared stageBuildLangfuseTurnContext ──
   // lane=requestKind: main/fork/sidequery 各自独立 turnSeq 车道。
+  // preResolvedTurnSeq=resolvedTurnSeq: 复用入口已算的权威 turnSeq, 跳过
+  // 本 stage 内重复的 countHumanTurns + Redis Lua, 保证 LLM generation 挂
+  // 到跟上面 injection / mem-command 同一条 Langfuse trace。
   const { turnSeq, lf } = await stageBuildLangfuseTurnContext({
     config, sessionKey, keyId, target, messages, protocol: "anthropic",
     traceTags, path: c.req.path, headers: lcHeaders, body, lane: requestKind,
+    wecomName,
+    spaceId,
+    preResolvedTurnSeq: resolvedTurnSeq,
   });
   stageReportAnalyzerTrace({ config, target, traceId, lf, keyId, sessionKey, turnSeq, startTime, spaceId });
 
@@ -1005,8 +1120,8 @@ export async function runAnthropicPipeline(
   // ── Opik: create trace ───────────────────────────────────────────────────
   const forkTraceId = _gates.opik ? opikCreateTrace(config, {
     traceId,
-    projectName: keyId,
-    name: `${target.model} / ${keyId}`,
+    projectName: wecomName || keyId,
+    name: `${target.model} / ${wecomName || keyId}`,
     startTime,
     input: { messages: flattenAnthropicMessagesForOpik(messages, body.system) },
     tags: [...traceTags, ...target.tags],
@@ -1054,8 +1169,8 @@ export async function runAnthropicPipeline(
     spaceId,
     lf,
     opikTraceId: traceId,
-    opikKeyId: keyId,
-    skipPrepare: costGuardMode === "cheap",
+    opikKeyId: wecomName || keyId,
+    skipPrepare: costGuardMode === "cheap" || target.skipPrepare === true,
   });
 
   const { body: upstreamBody, sanitizedCount } = buildUpstreamBody(body, target);
@@ -1065,6 +1180,12 @@ export async function runAnthropicPipeline(
       `stripped ${sanitizedCount} invalid thinking block(s) from history`,
     );
   }
+  const sessionTurnCtx = buildSessionTurnContext(config, sessionTurnSeed, {
+    spaceId,
+    sessionInfo,
+    authUserId: userId,
+    upstreamBody,
+  });
 
   // Retry headers: preserve original client headers (x-request-id, user-agent,
   // etc.), then force the primary upstream's auth — retry always goes to the
@@ -1085,6 +1206,7 @@ export async function runAnthropicPipeline(
     originalHeaders["x-api-key"] = effectiveApiKey;
     delete originalHeaders["authorization"];
   }
+  Object.assign(originalHeaders, anthropicUpstreamHeaderOverrides(config, target.retryTarget?.url));
 
   const retryBody = sanitizeThinkingBlocks(body).body;
 
@@ -1202,6 +1324,7 @@ export async function runAnthropicPipeline(
       config,
       modelId: effectiveModel,
       keyId,
+      obsProjectName: wecomName || keyId,
       sessionKey,
       upstreamUrl: target.url,
       requestPath: c.req.path,
@@ -1231,6 +1354,7 @@ export async function runAnthropicPipeline(
       skipCreditReport,
       isCustomUpstream: _isCustomUpstream,
       gates: _gates,
+      sessionTurnCtx: upstreamResp.ok ? sessionTurnCtx : null,
     });
 
     // CFQ 剥离排在最后：tap 走的是另一条 tee 分支，读到的仍是模型原始输出。
@@ -1254,6 +1378,9 @@ export async function runAnthropicPipeline(
   let assistantMessage: Record<string, unknown> | null = null;
   try {
     const respJson = JSON.parse(respText) as Record<string, unknown>;
+    if (upstreamResp.ok) {
+      submitSessionTurn(sessionTurnCtx, anthropicReplyFromJson(respJson), effectiveModel || requestedModel);
+    }
     if (respJson.usage && typeof respJson.usage === "object") {
       usage = respJson.usage as Record<string, unknown>;
     }
@@ -1377,7 +1504,7 @@ export async function runAnthropicPipeline(
     if (_gates.opik) {
       opikCreateLlmSpan(config, {
         traceId,
-        projectName: keyId,
+        projectName: wecomName || keyId,
         name: effectiveModel,
         startTime,
         endTime,
@@ -1417,6 +1544,7 @@ export async function runAnthropicPipeline(
       traceName: lf.traceName,
       userId: lf.userId,
       sessionId: lf.sessionId,
+      instanceId: lf.instanceId,
       tags: lf.tags,
       traceInput: lf.userQuery || undefined,
       traceOutput: langfuseOutput,
@@ -1620,6 +1748,8 @@ interface AnthropicTapContext {
   config: ProxyConfig;
   modelId: string;
   keyId: string;
+  /** Opik project the turn trace was created in (`wecomName || keyId`). */
+  obsProjectName: string;
   sessionKey: string;
   upstreamUrl: string;
   requestPath: string;
@@ -1665,6 +1795,8 @@ interface AnthropicTapContext {
   isCustomUpstream?: boolean;
   /** Stage-level gates from the resolved AgentStrategy. `undefined` = 100% CC behavior preserved. */
   gates?: import("../strategies/agent/types.js").StageGates;
+  /** Online session trace for this call; null when it is not recorded. */
+  sessionTurnCtx: SessionTurnContext | null;
 }
 
 /**
@@ -1687,6 +1819,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
     //   3. content_block_stop → 该块结束
     // 之前的实现只读了 (1) 里的 input（永远空）—— 现在按 index 累加 (2) 里的 partial_json。
     const toolUseAcc = new Map<number, { id: string; name: string; inputJson: string }>();
+    const replyAssembler = ctx.sessionTurnCtx ? new AnthropicMessageAssembler() : null;
 
     const timeoutHandle = setTimeout(() => {
       if (!streamCompleted) {
@@ -1700,6 +1833,8 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
       if (streamCompleted) return;
       streamCompleted = true;
       clearTimeout(timeoutHandle);
+
+      if (replyAssembler) submitSessionTurn(ctx.sessionTurnCtx, replyAssembler.result(), modelId);
 
       const endTime = new Date().toISOString();
 
@@ -1719,7 +1854,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
         });
         stageOpikStreamSpan({
           config, gates: ctx.gates, pipe,
-          traceId, forkTraceId, keyId, modelId, startTime, endTime,
+          traceId, forkTraceId, keyId, projectName: ctx.obsProjectName, modelId, startTime, endTime,
           inputMessages: flattenAnthropicMessagesForOpik(inputMessages, system),
           outputMessage: outputText ? { role: "assistant", content: outputText } : null,
           usage, retried, upstreamUrl,
@@ -1748,6 +1883,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
             traceName: lf.traceName,
             userId: lf.userId,
             sessionId: lf.sessionId,
+            instanceId: lf.instanceId,
             tags: lf.tags,
             traceInput: lf.userQuery || undefined,
             traceOutput: outputText ? { role: "assistant", content: outputText } : undefined,
@@ -1895,6 +2031,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
           try {
             const evt = JSON.parse(dataStr) as Record<string, unknown>;
             const evtType = evt.type as string;
+            replyAssembler?.push(evt);
 
             if (evtType === "message_start") {
               const message = evt.message as Record<string, unknown> | undefined;
@@ -1954,6 +2091,7 @@ function consumeAnthropicStream(stream: ReadableStream<Uint8Array>, ctx: Anthrop
         if (dataStr && dataStr !== "[DONE]") {
           try {
             const evt = JSON.parse(dataStr) as Record<string, unknown>;
+            replyAssembler?.push(evt);
             if (evt.type === "message_delta" && evt.usage) {
               Object.assign(usage, evt.usage as Record<string, unknown>);
             }

@@ -35,6 +35,7 @@ import type {
   WikiSourceImportResult,
   SourceCredentialStatus,
   ResourceType,
+  SshKeyInfo,
 } from '../ports/knowledge-client-port.js';
 
 export interface KnowledgeClientConfig {
@@ -121,6 +122,21 @@ export class HttpKnowledgeClient implements KnowledgeClientPort {
   /** 已启用的 wiki 来源列表（前端下拉数据源）。 */
   async sourceProviderListWiki(): Promise<SourceProviderList> {
     return this.request<SourceProviderList>('GET', '/v3/source-provider/wiki');
+  }
+
+  /**
+   * SSH 密钥：取（必要时生成）。
+   *
+   * 身份走 header（x-tdai-team-id / x-tdai-user-id），body 为空 ——
+   * KS 侧不接受 body 里的 user_id，避免越权取他人公钥。
+   */
+  async sshKeyEnsure(actor: { teamId: string; userId: string }): Promise<SshKeyInfo> {
+    return this.request<SshKeyInfo>('POST', '/v3/ssh-key/ensure', { body: {}, ...actor });
+  }
+
+  /** SSH 密钥：只读取回已存在的公钥（不生成）。 */
+  async sshKeyGet(actor: { teamId: string; userId: string }): Promise<SshKeyInfo> {
+    return this.request<SshKeyInfo>('POST', '/v3/ssh-key/get', { body: {}, ...actor });
   }
 
   /**

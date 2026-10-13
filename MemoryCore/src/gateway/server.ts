@@ -17,7 +17,7 @@
 import http from "node:http";
 import { join } from "node:path";
 import { URL } from "node:url";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import zlib from "node:zlib";
 import dayjs from "dayjs";
 import { TdaiCore } from "../core/tdai-core.js";
@@ -65,6 +65,7 @@ import { handleV2Route, errorEnvelope, makeRequestId } from "./v2-router.js";
 import type { V2RouterDeps } from "./v2-router.js";
 import { handleV3MetaRoute, V3_PREFIX } from "../metadata/router/v3-meta-router.js";
 import { handleV3TaskSourceRoute } from "../metadata/router/v3-task-source-router.js";
+import { handleV3SessionRoute, V3_SESSION_ADD_PATH } from "./v3-session-router.js";
 import { handleInternalMetaRoute, V3_INTERNAL_PREFIX } from "../metadata/router/internal-meta-router.js";
 import { MetadataService } from "../metadata/service/metadata-service.js";
 import { ConfigParamService } from "../metadata/service/config-param-service.js";
@@ -181,9 +182,10 @@ function createConsoleLogger(): Logger {
  * triggered by the combination of env reads and the documented route
  * comments above.
  */
-import { resolveMaxBodyBytes } from "../utils/env-config.js";
+import { resolveMaxBodyBytes, resolveSessionMaxBodyBytes } from "../utils/env-config.js";
 
 const MAX_BODY_BYTES = resolveMaxBodyBytes();
+const SESSION_MAX_BODY_BYTES = resolveSessionMaxBodyBytes();
 
 /**
  * Thrown by `parseJsonBody` when the incoming body exceeds `MAX_BODY_BYTES`.
@@ -200,16 +202,38 @@ export class PayloadTooLargeError extends Error {
   }
 }
 
-export async function parseJsonBody<T>(req: http.IncomingMessage): Promise<T> {
+/**
+ * After a 413 rejection, keep reading (and discarding) the rest of the body so
+ * the 413 response reaches the client instead of a connection reset. Destroying
+ * the socket right away makes clients see ECONNRESET, which callers treat as
+ * retryable. Discarding is capped at `budgetBytes`; past that the socket is
+ * destroyed as before.
+ */
+function discardRemainingBody(req: http.IncomingMessage, budgetBytes: number): void {
+  let discarded = 0;
+  req.on("data", (chunk: Buffer) => {
+    discarded += chunk.length;
+    if (discarded > budgetBytes) req.destroy();
+  });
+  req.resume();
+}
+
+export async function parseJsonBody<T>(
+  req: http.IncomingMessage,
+  maxBytes: number = MAX_BODY_BYTES,
+): Promise<T> {
   return new Promise((resolve, reject) => {
-    // Reject early when Content-Length header already exceeds the limit:
-    // saves transferring up to MAX_BODY_BYTES of attacker-controlled data.
+    // Reject early when Content-Length header already exceeds the limit.
+    // Bodies declared far above the limit are cut off without reading them.
     const declared = Number.parseInt(req.headers["content-length"] ?? "", 10);
-    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
-      reject(new PayloadTooLargeError(MAX_BODY_BYTES));
-      // Drain & destroy so the client doesn't keep streaming.
-      req.resume();
-      req.destroy();
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      reject(new PayloadTooLargeError(maxBytes));
+      if (declared > maxBytes * 2) {
+        req.resume();
+        req.destroy();
+      } else {
+        discardRemainingBody(req, maxBytes);
+      }
       return;
     }
 
@@ -234,10 +258,14 @@ export async function parseJsonBody<T>(req: http.IncomingMessage): Promise<T> {
     source.on("data", (chunk: Buffer) => {
       if (aborted) return;
       received += chunk.length;
-      if (received > MAX_BODY_BYTES) {
+      if (received > maxBytes) {
         aborted = true;
-        reject(new PayloadTooLargeError(MAX_BODY_BYTES));
-        req.destroy();
+        reject(new PayloadTooLargeError(maxBytes));
+        if (source !== req) {
+          req.unpipe();
+          (source as unknown as { destroy: () => void }).destroy();
+        }
+        discardRemainingBody(req, maxBytes);
         return;
       }
       chunks.push(chunk);
@@ -927,6 +955,23 @@ export class TdaiGateway {
         return await this.handleInstanceDestroyV3(req, res);
       }
 
+      // ── /v3/session/add — session turn records (docs/session-api.md).
+      //    Bearer apiKey gate only; identity headers are validated inside the
+      //    router (missing → 400). Uses its own body limit (default 32 MiB).
+      if (pathname === V3_SESSION_ADD_PATH) {
+        if (!this.checkAuthForV2(req, res)) return;
+        const handledSession = await handleV3SessionRoute(
+          req, res, pathname, method,
+          (r) => parseJsonBody(r, SESSION_MAX_BODY_BYTES),
+          sendJson,
+          {
+            resolveStorage: (instanceId) => this.resolveSessionStorageForInstance(instanceId),
+            logger: this.logger,
+          },
+        );
+        if (handledSession) return;
+      }
+
       // ── v3 internal metadata（/v3/internal/meta/*，仅 Bearer）──
       if (pathname.startsWith(`${V3_INTERNAL_PREFIX}/`)) {
         if (!this.checkAuthForV2(req, res)) return;
@@ -1495,6 +1540,10 @@ export class TdaiGateway {
       stores: {
         vectorStore: !!this.core.getVectorStore(),
         embeddingService: !!this.core.getEmbeddingService(),
+        // BM25 keyword search depends on the FTS5 module, which is not
+        // compiled into every official Node build (e.g. v22.13.1). When
+        // false, recall degrades to embedding-only (issue #679).
+        ftsAvailable: this.core.getVectorStore()?.isFtsAvailable() ?? false,
       },
       // Integrated services status
       services: {
@@ -2668,6 +2717,19 @@ export class TdaiGateway {
   }
 
   /**
+   * Storage for `/v3/session/add`: always the local/COS file backend of the
+   * instance, never the rowfs / mongofs legs that resolveStorageForInstance
+   * may select. Service mode lazily initializes COS with a single attempt so
+   * a COS outage fails the request fast (503) instead of blocking on retries.
+   */
+  private async resolveSessionStorageForInstance(instanceId: string): Promise<StorageAdapter> {
+    if (!this.sharedCosClient && this.config.deployMode !== "standalone") {
+      await this.initSharedCosClient(1);
+    }
+    return this.resolveFileOthersForInstance(instanceId);
+  }
+
+  /**
    * 形态原有的文件后端（standalone→local / service→cos），per-instance 缓存。
    * 既是 local/cos 模式的正面路径，也是 rowfs 模式组合后端的 others 侧。
    */
@@ -3042,7 +3104,29 @@ export class TdaiGateway {
           } catch { /* ok */ }
         }
 
-        const result = await core.runL2WithStore(task.sessionId, store, storage ?? undefined, cursor);
+        const jevGateId = randomUUID();
+        const result = await core.runL2WithStore(
+          task.sessionId,
+          store,
+          storage ?? undefined,
+          cursor,
+          {
+            l2TaskId: task.id,
+            jevGateId,
+            signal,
+            teamId,
+            userId: typeof task.data?.userId === "string" ? task.data.userId : undefined,
+            agentId,
+            sessionId: task.sessionId,
+          },
+          resolveCheckpointLock(instanceId),
+        );
+        task.data = {
+          ...task.data,
+          l2TaskId: task.id,
+          jevGateId: result.jevGateId ?? jevGateId,
+          l2SceneDiff: result.sceneDiff,
+        };
 
         // Mark task as skipped if L2 had no new records to process
         if (result.skipped) {
@@ -3096,7 +3180,22 @@ export class TdaiGateway {
 
         core.setInstanceId(instanceId);
         const { store } = await resolveStore(task);
-        const result = await core.runL3WithStore(store, storage ?? undefined);
+        const result = await core.runL3WithStore(
+          store,
+          storage ?? undefined,
+          {
+            l2TaskId: typeof task.data?.l2TaskId === "string" ? task.data.l2TaskId : undefined,
+            l3TaskId: task.id,
+            jevGateId: typeof task.data?.jevGateId === "string" ? task.data.jevGateId : undefined,
+            sceneDiff: task.data?.l2SceneDiff as import("../core/persona/jev-gate.js").L2SceneDiffDiagnostic | undefined,
+            signal,
+            teamId: task.teamId ?? (typeof task.data?.teamId === "string" ? task.data.teamId : undefined),
+            userId: typeof task.data?.userId === "string" ? task.data.userId : undefined,
+            agentId: task.agentId ?? (typeof task.data?.agentId === "string" ? task.data.agentId : undefined),
+            sessionId: task.sessionId,
+          },
+          resolveCheckpointLock(instanceId),
+        );
 
         // Report credit + memory (only +1 on first persona creation)
         // provider=proxy 模式下 credit 由 context_proxy 上报，此处仅报 memory delta。

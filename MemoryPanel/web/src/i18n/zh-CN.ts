@@ -491,21 +491,35 @@ export const zhCN = {
   'code.register.caption': '注册代码仓库',
   'code.register.gitUrl': 'Git URL',
   'code.register.gitUrlExtra': '注册后将自动 clone 并建立代码索引。',
+  // Git URL 输入框示例：按「来源」切换（SSH 来源显示 git@，其余保持 https://）。
   'code.register.gitUrlPlaceholder': 'https://gitlab.example.com/namespace/repo.git',
+  'code.register.gitUrlPlaceholderSsh': 'git@github.com:namespace/repo.git 或 ssh://git@host:2222/namespace/repo.git',
   'code.register.branch': '分支',
-  'code.register.sshWarning':
-    '当前版本不支持 SSH 格式的仓库地址，请改用 HTTPS 格式（如 https://gitlab.example.com/namespace/repo.git）。',
+  'code.register.sshHint':
+    '已识别为 SSH 仓库。点击「注册」后会先为你生成 SSH 公钥，请把公钥添加到代码平台后再继续。',
   'code.register.urlError':
-    '请输入合法的 HTTP(S) Git 仓库地址，且必须以 .git 结尾（如 https://gitlab.example.com/namespace/repo.git），不能含空格。',
+    '请输入合法的 Git 仓库地址（HTTPS 或 SSH），且必须以 .git 结尾，不能含空格。',
   'code.register.invalidUrl':
-    '请输入合法的 HTTPS Git 仓库地址，且必须以 .git 结尾（如 https://gitlab.example.com/namespace/repo.git），不能含空格。',
+    '请输入合法的 Git 仓库地址：HTTPS 形如 https://gitlab.example.com/namespace/repo.git，SSH 形如 git@github.com:namespace/repo.git 或 ssh://git@host:2222/namespace/repo.git。',
   'code.register.submitting': '注册中…',
   'code.register.submit': '注册',
   'code.register.source': '来源',
   'code.register.sourceExtra': '私有仓库请选择来源并填写访问令牌；公开仓库保持「公开」即可。',
+  'code.register.sourceSshExtra': 'SSH 仓库无需令牌，使用你账号下的 SSH 密钥拉取。',
   'code.register.sourcePublic': '公开（无需令牌）',
   // 来源展示名按来源 id 本地化；后端若下发 display_name 则以其为准（见 CodeSourcesPanel）。
   'code.source.gongfeng': '腾讯工蜂',
+  'code.source.ssh': 'SSH',
+  // SSH 公钥（两段式注册第 1 段）
+  'code.sshKey.caption': '配置 SSH 公钥',
+  'code.sshKey.publicKey': 'SSH 公钥',
+  'code.sshKey.copy': '复制',
+  'code.sshKey.guideTitle': '请按以下步骤完成配置：',
+  'code.sshKey.guideStep1': '复制上方公钥；',
+  'code.sshKey.guideStep2': '到代码平台的 SSH Keys 设置页添加该公钥；',
+  'code.sshKey.guideStep3': '确认添加完成后，点击右下角「已配置，继续注册」。',
+  'code.sshKey.guideNote': '同一账号只会生成一次密钥，之后注册其它 SSH 仓库可直接复用，无需重复配置。',
+  'code.sshKey.continue': '已配置，继续注册',
   'code.register.token': '访问令牌',
   // 凭据字段 i18n：按 form_field.name 组织，支持不同认证方式的动态渲染
   'code.credField.secret.label': '访问令牌',

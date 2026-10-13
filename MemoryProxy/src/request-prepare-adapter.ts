@@ -48,6 +48,7 @@ import type { Pipeline } from "./logger.js";
 import { log } from "./report/log.js";
 import { langfuseReportGeneration, type LangfuseTurnContext } from "./langfuse.js";
 import { opikCreateLlmSpan } from "./opik.js";
+import { protectSkillResults } from "./skill/selection/delivery/protect-results.js";
 
 // ─── Dynamic import + no-op fallback ────────────────────────────────────────
 
@@ -244,10 +245,7 @@ export interface PrepareUpstreamRequestArgs {
    * Key ID for the Opik project name dimension. Required when opikTraceId is set.
    */
   opikKeyId?: string;
-  /**
-   * When true, skip the preparation (compression) stage entirely. Used by
-   * `/cost-guard/cheap` mode which only wants routing, not compression.
-   */
+
   skipPrepare?: boolean;
 }
 
@@ -290,6 +288,8 @@ export async function prepareUpstreamRequest(
   if (!options) return null;
   if (typeof _mod.prepareUpstreamRequest !== "function") return null;
 
+  // skill 正文不参与压缩（见 protect-skill-results.ts）；finally 保证异常时也写回。
+  const restoreSkillResults = protectSkillResults(args.messages);
   try {
     const result = await _mod.prepareUpstreamRequest(
       args.protocol,
@@ -322,6 +322,8 @@ export async function prepareUpstreamRequest(
   } catch (err: unknown) {
     args.pipe.error("REQUEST_PREPARE", err);
     return null;
+  } finally {
+    restoreSkillResults();
   }
 }
 
@@ -376,6 +378,8 @@ function reportPrepareObservations(
           traceName: lf.traceName,
           userId: lf.userId,
           sessionId: lf.sessionId,
+          // 请求准备阶段（压缩等）的内部 LLM 调用同属该 turn 的实例。
+          instanceId: lf.instanceId,
           tags: [
             ...lf.tags,
             ...(Array.isArray(obs.tags)

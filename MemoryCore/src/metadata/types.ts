@@ -552,6 +552,46 @@ export interface ListConfigParamsFilter {
 }
 
 // ============================
+// User Session Default（v3.3 新增）
+// ============================
+//
+// 对应设计文档: MemoryProxy/docs/design/2026-10-10-user-session-default-design.md
+//
+// "用户级 session 默认配置" —— 每个 user_id 至多一行,保存 (team_id, agent_id,
+// task_id) 三元组。task_id === DEFAULT_TASK_SENTINEL ("default") 表示"不绑定
+// 任何 Task"(与 Proxy 侧 sessionInit.defaultTaskId 字面量契约一致)。
+//
+// Service 层对 "default" 字面量走短路, 不去 Core 里 requireEntity(Task) —— 内核中
+// 不存在 id="default" 的 task, 强校验会报 entity_not_found。详见
+// user-session-default-service.ts。
+
+/**
+ * 用户选"不绑定任何 Task"时存入 task_id 的字面量。
+ *
+ * ⚠️ 必须和 Proxy 侧 `sessionInit.defaultTaskId` 的默认值 (MemoryProxy/src/config.ts:97)
+ * 保持一致 —— 整条 session-init 链路已经围绕这个字面量建立识别机制 (Proxy
+ * `session/codebuddy/init.ts` 10+ 处 `task_id !== config.defaultTaskId` 短路)。
+ */
+export const DEFAULT_TASK_SENTINEL = "default";
+
+export interface UserSessionDefaultEntity {
+  user_id: string;
+  team_id: string;
+  agent_id: string;
+  /** 真实 task_id 或字面量 DEFAULT_TASK_SENTINEL。 */
+  task_id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UpsertUserSessionDefaultInput {
+  user_id: string;
+  team_id: string;
+  agent_id: string;
+  task_id: string;
+}
+
+// ============================
 // InstanceUpstreamConfig 类型（v2 模型组结构）
 // ============================
 //

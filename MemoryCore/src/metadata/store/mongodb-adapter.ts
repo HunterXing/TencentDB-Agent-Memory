@@ -60,6 +60,8 @@ import type {
   ConfigParamEntity,
   UpsertConfigParamInput,
   ListConfigParamsFilter,
+  UserSessionDefaultEntity,
+  UpsertUserSessionDefaultInput,
   InstanceUpstreamConfigEntity,
   InstanceUpstreamConfigFilter,
   CreateInstanceUpstreamGroupInput,
@@ -284,6 +286,15 @@ export class MongoMetadataStore implements IMetadataStore {
         { user_id: 1, module: 1 },
         { partialFilterExpression: { scope: "user" } },
       ),
+
+      // ── meta_user_session_defaults (v3.3) ──
+      // user_id 是 PK (unique); task_id 存 "default" 字面量或真实 id (非空),
+      // 用普通索引即可(不需 sparse)。
+      this.ensureIndex("meta_user_session_defaults",
+        { user_id: 1 }, { unique: true }),
+      this.ensureIndex("meta_user_session_defaults", { team_id: 1 }),
+      this.ensureIndex("meta_user_session_defaults", { agent_id: 1 }),
+      this.ensureIndex("meta_user_session_defaults", { task_id: 1 }),
 
       // ── meta_instance_upstream_config (v2 模型组) ──
       this.ensureIndex("meta_instance_upstream_config",
@@ -1516,6 +1527,52 @@ export class MongoMetadataStore implements IMetadataStore {
       .sort({ scope: 1, param_name: 1 })
       .toArray();
     return docs as unknown as ConfigParamEntity[];
+  }
+
+  // ============================================================
+  // UserSessionDefault (v3.3) — 用户级 (team, agent, task) 默认三元组
+  // ============================================================
+
+  async getUserSessionDefault(userId: string): Promise<UserSessionDefaultEntity | null> {
+    const doc = await this.col("meta_user_session_defaults").findOne(
+      { user_id: userId },
+      PROJECT_NO_ID,
+    );
+    return doc ? (doc as unknown as UserSessionDefaultEntity) : null;
+  }
+
+  async upsertUserSessionDefault(
+    input: UpsertUserSessionDefaultInput,
+  ): Promise<UserSessionDefaultEntity> {
+    const now = nowIso();
+    // upsert: 存在则更新 team/agent/task + updated_at, 不存在则插入含 created_at。
+    // 不用 _id = user_id 的习惯 —— 保持与 SQLite 的字段结构字节一致(避免序列化处漂移)。
+    await this.col("meta_user_session_defaults").findOneAndUpdate(
+      { user_id: input.user_id },
+      {
+        $set: {
+          team_id: input.team_id,
+          agent_id: input.agent_id,
+          task_id: input.task_id,
+          updated_at: now,
+        },
+        $setOnInsert: {
+          user_id: input.user_id,
+          created_at: now,
+        },
+      },
+      { upsert: true, returnDocument: "after" },
+    );
+    const row = await this.getUserSessionDefault(input.user_id);
+    if (!row) {
+      throw new Error("upsertUserSessionDefault: row disappeared after write");
+    }
+    return row;
+  }
+
+  async deleteUserSessionDefault(userId: string): Promise<number> {
+    const res = await this.col("meta_user_session_defaults").deleteOne({ user_id: userId });
+    return res.deletedCount ?? 0;
   }
 
   // ── InstanceUpstreamConfig (v2 模型组) ─────────────────────────────────

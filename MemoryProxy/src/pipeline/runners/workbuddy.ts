@@ -24,6 +24,7 @@ import { createPipeline, writeLog } from "../../logger.js";
 import { extractSpaceIdFromPath } from "../../credit-reporter.js";
 import { writeFailedReportRaw } from "../../clickhouse.js";
 import { joinUrl } from "../../guard-adapter.js";
+import { poolServiceRejection } from "../../pool-service.js";
 import {
   stageInstanceUpstreamResponses,
   isInstanceUpstreamBlocked,
@@ -77,6 +78,16 @@ import {
 // ── TDAI L0 + Skill extraction imports ────────────────────────────────────────
 import { TdaiClient, buildTdaiClientForRequest } from "../../tdai/client.js";
 import { deriveTdaiIdentity } from "../../tdai/identity.js";
+import {
+  ResponsesAssembler,
+  buildSessionTurnContext,
+  createSessionTurnSeed,
+  parseSseData,
+  responsesReplyFromJson,
+  submitSessionTurn,
+  type PendingSessionTurn,
+  type SessionTurnContext,
+} from "../../session-trace/index.js";
 import type { TdaiIdentity, TdaiMessage } from "../../tdai/types.js";
 import { stageArchive } from "../stages/archive.js";
 import {
@@ -90,6 +101,7 @@ import { stageAssetCapabilities } from "../stages/asset-capabilities.js";
 import { stageSessionBypass } from "../stages/session-bypass.js";
 import { stageSessionInitOrchestrate } from "../stages/session-init-orchestrate.js";
 import { buildMemResponse } from "../../mem-command/response-builder.js";
+import { hasExplicitAgentName, requireWecomIdentity } from "../../wecom-identity-form.js";
 
 // ── Handler-level constants ──────────────────────────────────────────────────
 
@@ -458,10 +470,12 @@ async function forwardToUpstream(
   traceId: string,
   startTime: string,
   keyId: string,
+  obsProjectName: string,
   modelId: string,
   pipe: ReturnType<typeof createPipeline>,
   lf: LangfuseTurnContext | null,
   archiveCtx: WorkbuddyArchiveCtx | null = null,
+  sessionTurn: PendingSessionTurn | null = null,
 ): Promise<Response> {
   // ── Per-agent upstream override ──
   // 对齐 codexHandler: 支持 config.upstream.agents?.workbuddy 单独指 URL/apiKey，
@@ -533,11 +547,19 @@ async function forwardToUpstream(
       userQuery: lf.userQuery,
       lf,
       opikTraceId: traceId,
-      opikKeyId: keyId,
+      opikKeyId: obsProjectName,
     });
   }
 
   const bodyStr = JSON.stringify(body);
+  const sessionTurnCtx = sessionTurn
+    ? buildSessionTurnContext(config, sessionTurn.seed, {
+        spaceId,
+        sessionInfo: sessionTurn.sessionInfo,
+        authUserId: sessionTurn.authUserId,
+        upstreamBody: body,
+      })
+    : null;
 
   // 结构化埋点：与 codex 对齐（forwardStart / forwardDone / info 三段式）
   pipe.forwardStart(upstreamUrl);
@@ -552,8 +574,8 @@ async function forwardToUpstream(
     const inputMessages = extractForOpik(body.input);
     forkTraceId = opikCreateTrace(config, {
       traceId,
-      projectName: keyId,
-      name: `${modelId} / ${keyId}`,
+      projectName: obsProjectName,
+      name: `${modelId} / ${obsProjectName}`,
       startTime,
       input: { messages: inputMessages },
       tags: lf?.tags ?? [],
@@ -693,6 +715,7 @@ async function forwardToUpstream(
       }
       mergeResponsesToolCalls(toolCalls, responseBody.output);
       outputText = collectResponsesOutputText(responseBody);
+      if (upstreamResp.ok) submitSessionTurn(sessionTurnCtx, responsesReplyFromJson(responseBody), modelId);
     } catch {
       // Preserve an unexpected non-JSON response without billing it.
     }
@@ -780,6 +803,7 @@ async function forwardToUpstream(
     startTime,
     modelId,
     keyId,
+    obsProjectName,
     traceId,
     forkTraceId,
     lf,
@@ -793,6 +817,7 @@ async function forwardToUpstream(
     archiveCtx,
     inputBody: body,
     upstreamUrl,
+    sessionTurnCtx: upstreamResp.ok ? sessionTurnCtx : null,
   });
 
   // CFQ 剥离排在最后：tap 走的是另一条 tee 分支，读到的仍是模型原始输出。
@@ -816,6 +841,8 @@ interface WorkbuddyTapContext {
   startTime: string;
   modelId: string;
   keyId: string;
+  /** Opik project the turn trace was created in (`wecomName || keyId`). */
+  obsProjectName: string;
   traceId: string;
   /** Opik fork trace id (request_log 项目)；opik 关闭时 undefined。 */
   forkTraceId?: string;
@@ -845,6 +872,8 @@ interface WorkbuddyTapContext {
   inputBody: Record<string, unknown>;
   /** 上游 URL，写进 observationMetadata 便于排障 */
   upstreamUrl: string;
+  /** Online session trace for this call; null when it is not recorded. */
+  sessionTurnCtx: SessionTurnContext | null;
 }
 
 /**
@@ -875,6 +904,7 @@ async function consumeWorkbuddyStream(
   // 按 call_id 累积工具调用，供增量会话的 CFQ 侧信道使用。output_item.done
   // 与 completed 会重复给出同一条，Map 去重后以终态为准。
   const toolCalls = new Map<string, UpstreamToolCall>();
+  const replyAssembler = ctx.sessionTurnCtx ? new ResponsesAssembler() : null;
 
   // P: 5 分钟超时兜底。上游或客户端断链可能让 reader.read() 一直挂起，
   // 用 setTimeout 强制 cancel，避免 tap coroutine 泄漏。用 flag 而不是
@@ -911,6 +941,7 @@ async function consumeWorkbuddyStream(
         try {
           const evt = JSON.parse(payload) as Record<string, unknown>;
           const evtType = evt.type as string | undefined;
+          replyAssembler?.push(evt);
           if (evtType === "response.output_text.delta") {
             const delta = evt.delta;
             if (typeof delta === "string") assistantText += delta;
@@ -954,6 +985,11 @@ async function consumeWorkbuddyStream(
     } catch {
       /* noop */
     }
+  }
+
+  if (replyAssembler) {
+    parseSseData(buf).forEach((evt) => replyAssembler.push(evt));
+    submitSessionTurn(ctx.sessionTurnCtx, replyAssembler.result(), ctx.modelId);
   }
 
   const endTime = new Date().toISOString();
@@ -1020,6 +1056,7 @@ async function consumeWorkbuddyStream(
       traceName: ctx.lf.traceName,
       userId: ctx.lf.userId,
       sessionId: ctx.lf.sessionId,
+      instanceId: ctx.lf.instanceId,
       tags: ctx.lf.tags,
       traceInput: ctx.lf.userQuery || undefined,
       traceOutput: assistantText,
@@ -1049,7 +1086,7 @@ async function consumeWorkbuddyStream(
       // Opik 以 "must be a version 7 UUID" 400 拒掉整个 span。
       traceId: ctx.traceId,
       forkTraceId: ctx.forkTraceId,
-      keyId: ctx.keyId, modelId: ctx.modelId,
+      keyId: ctx.keyId, projectName: ctx.obsProjectName, modelId: ctx.modelId,
       startTime: ctx.startTime, endTime,
       inputMessages: [{ role: "user", content: JSON.stringify(ctx.inputBody?.input ?? []) }],
       outputMessage: assistantText ? { role: "assistant", content: assistantText } : null,
@@ -1146,6 +1183,14 @@ export async function runWorkbuddyPipeline(
   // workbuddy 的 skill/memory/session_context 从此全丢。TS 2588 一直报警
   // 但被当成"重构遗留基线错误"没人修。
   let body = parseResult.body;
+  let wecomName = "";
+  if (hasExplicitAgentName(path)) {
+    const wecomIdentity = await requireWecomIdentity(config, apiKey, body, "responses");
+    if (wecomIdentity.kind !== "resolved") return wecomIdentity.response;
+    wecomName = wecomIdentity.name;
+  }
+  const poolRejection = poolServiceRejection(config, body.model);
+  if (poolRejection) return c.json(poolRejection, 400);
 
   // ── 3. Extract headers ───────────────────────────────────────────────────
   const headers: Record<string, string> = {};
@@ -1205,7 +1250,7 @@ export async function runWorkbuddyPipeline(
   // ── 5. Aux passthrough ───────────────────────────────────────────────────
   if (isAuxiliary) {
     pipe.info("WORKBUDDY_AUX", `auxiliary request → passthrough (path=${path})`);
-    return forwardToUpstream(c, config, body, traceId, startTime, keyId, modelId, pipe, null, null);
+    return forwardToUpstream(c, config, body, traceId, startTime, keyId, wecomName || keyId, modelId, pipe, null, null);
   }
 
   // ── 6. Session ID + langfuse turn ctx ────────────────────────────────────
@@ -1214,15 +1259,27 @@ export async function runWorkbuddyPipeline(
   const agentSource = "workbuddy";
   const isStream = body.stream !== false;
   const callerUserKey = apiKey || null;
+  const sessionTurnSeed = createSessionTurnSeed(config, {
+    agent: agentSource,
+    path,
+    protocol: "responses",
+    headers,
+    body,
+    sessionId: sessionKey,
+    startedAt: startTime,
+  });
 
   const turnSeq = countHumanTurnsResponses(body.input);
   const userQuery = workbuddyAdapter.extractUserText(body.input) ?? "";
   const lf: LangfuseTurnContext = {
     traceId: langfuseTurnTraceId(sessionKey, turnSeq),
     turnSeq,
-    traceName: `${modelId} / ${keyId}`,
-    userId: keyId,
+    traceName: `${modelId} / ${wecomName || keyId}`,
+    userId: wecomName || keyId,
     sessionId: sessionKey,
+    // 记忆实例 ID（kernel tenant）—— 供 Langfuse 按实例筛选/归集。
+    // 内部仍叫 spaceId（CH/credit 命名）；只有 Langfuse 对外叫 instanceId。
+    instanceId: spaceId || undefined,
     tags: [
       `agent_source:${agentSource}`,
       "protocol:responses",
@@ -1246,6 +1303,8 @@ export async function runWorkbuddyPipeline(
   let sessionInfo: Record<string, unknown> | null | undefined;
   let assetCapabilities: import("../../injection/types.js").AssetCapabilityFlags | undefined;
   let injectionSkipped = false;
+  /** session-init 状态机在本轮完成注册 —— 本轮不触发 client_tool skill 加载。 */
+  let sessionJustRegistered = false;
   let cachedAgentDetail: unknown = null;
   let cachedTaskDetail: unknown = null;
   let _resetFlowResult: { agentName: string; agentIdShort: string; teamName?: string; teamIdShort: string; taskName?: string | null; bypassed?: boolean } | null = null;
@@ -1417,6 +1476,7 @@ export async function runWorkbuddyPipeline(
       cachedAgentDetail = initResult.agentDetail ?? null;
       cachedTaskDetail = initResult.taskDetail ?? null;
 
+      if (initResult.justRegistered) sessionJustRegistered = true;
       if (initResult.resetFlow && initResult.justRegistered && !initResult.bypassed) {
         _resetFlowResult = {
           agentName: initResult.agentDetail?.name ?? "未知",
@@ -1548,6 +1608,7 @@ export async function runWorkbuddyPipeline(
             traceName: lf.traceName,
             userId: lf.userId,
             sessionId: lf.sessionId,
+            instanceId: lf.instanceId,
             tags: [...lf.tags, `mem_cmd:${memCmd.command}`],
             traceInput: userText ?? undefined,
             traceOutput: memResult.messageText ?? "OK",
@@ -1615,6 +1676,8 @@ export async function runWorkbuddyPipeline(
           session: sessionInfo,
           userKey: callerUserKey ?? undefined,
           assetCapabilities,
+          // 合成 body 只抽取 system 文本，消息级注入（selected skill）无处落地。
+          messageInjection: false,
         },
       });
 
@@ -1636,6 +1699,26 @@ export async function runWorkbuddyPipeline(
     }
   }
 
+  // ── 9b. Skill selection (proxy 选择 → 客户端加载) ───────────────────────────
+  // 与 codex 对称：Responses 协议，新用户轮次直接返回 function_call 由客户端加载。
+  if (!injectionSkipped && !sessionJustRegistered && sessionInfo && Array.isArray(body.input)) {
+    const { tryClientToolDelivery } = await import("../../skill/selection/delivery/client-tool.js");
+    const resp = await tryClientToolDelivery(config, {
+      protocol: "responses",
+      body,
+      messages: body.input,
+      upstreamUrl: "",
+      stream: isStream,
+      model: String(modelId ?? ""),
+      session: sessionInfo as Parameters<typeof tryClientToolDelivery>[1]["session"],
+      conversationId: sessionId,
+      sessionKey,
+      agentSource: "workbuddy",
+      skillCapability: assetCapabilities?.skill !== false,
+    });
+    if (resp) return resp;
+  }
+
   // ── 10. Forward ──────────────────────────────────────────────────────────
   const archiveCtx = buildWorkbuddyArchiveCtx({
     config,
@@ -1647,5 +1730,9 @@ export async function runWorkbuddyPipeline(
     callerUserKey,
     assetCapabilities,
   });
-  return forwardToUpstream(c, config, body, traceId, startTime, keyId, modelId, pipe, lf, archiveCtx);
+  return forwardToUpstream(c, config, body, traceId, startTime, keyId, wecomName || keyId, modelId, pipe, lf, archiveCtx, {
+    seed: sessionTurnSeed,
+    sessionInfo,
+    authUserId: userId,
+  });
 }
