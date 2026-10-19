@@ -224,6 +224,11 @@ describe("evaluateL3JevGate semantic overflow policy", () => {
 
   it("keeps the upstream defer behavior when the policy is not selected", async () => {
     vi.stubEnv("JEV_STATE_LIMIT_CHARS", "1500");
+    // Pinned explicitly: the test asserts the behavior of a policy that is
+    // not in effect, but the production container runs with
+    // JEV_STATE_OVERFLOW_POLICY=semantic, and an inherited value would
+    // silently change what is being tested.
+    vi.stubEnv("JEV_STATE_OVERFLOW_POLICY", "");
     await seed("P".repeat(300), [{ filename: "big.md", summary: "big scene", body: "B".repeat(20_000) }]);
 
     const { runner } = makeRunner(() => "## 压缩\n内容。");

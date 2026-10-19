@@ -123,6 +123,10 @@ describe("evaluateL3JevGate state overflow", () => {
 
   it("keeps the upstream defer behavior when no policy is set", async () => {
     vi.stubEnv("JEV_STATE_LIMIT_CHARS", "1500");
+    // Pinned explicitly: the test asserts the unset-policy behavior, but the
+    // production container runs with JEV_STATE_OVERFLOW_POLICY=semantic, and
+    // an inherited value would silently change what is being tested.
+    vi.stubEnv("JEV_STATE_OVERFLOW_POLICY", "");
     await seed("P".repeat(300), [{ filename: "big.md", summary: "big scene", body: "B".repeat(20_000) }]);
 
     const { logger } = makeLogger();
