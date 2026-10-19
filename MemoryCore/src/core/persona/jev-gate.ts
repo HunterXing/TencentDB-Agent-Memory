@@ -18,6 +18,12 @@ import {
   trimJevStateForLimit,
   type JevTrimResult,
 } from "./jev-state-trim.js";
+import {
+  buildSemanticRewritePrompt,
+  compressJevStateSemantically,
+  type JevSemanticOutcome,
+} from "./jev-state-semantic.js";
+import type { LLMRunner } from "../types.js";
 
 export const JEV_PROMPT_VERSION = "l3-memory-change-v1";
 /** Default JEV state budget; the effective value resolves from env at call time. */
@@ -130,6 +136,13 @@ export async function evaluateL3JevGate(opts: {
   triggerReason: string;
   context?: L3JevExecutionContext;
   fetcher?: typeof fetch;
+  /**
+   * Text-only LLM runner used by the `semantic` overflow policy to rewrite
+   * oversized scene bodies before the decision. Must be tool-free
+   * (`enableTools: false`). When absent, the semantic policy falls back to the
+   * positional trim policy.
+   */
+  llmRunner?: LLMRunner;
 }): Promise<JevGateResult> {
   const startedAt = Date.now();
   const gateId = opts.context?.jevGateId ?? randomUUID();
@@ -196,7 +209,33 @@ export async function evaluateL3JevGate(opts: {
   const overflowPolicy = resolveJevOverflowPolicy();
   let sentState = state;
   let trimResult: JevTrimResult | null = null;
-  if (state.length > stateLimit && overflowPolicy === "trim") {
+  let semanticOutcome: JevSemanticOutcome | null = null;
+
+  if (state.length > stateLimit && overflowPolicy === "semantic" && opts.llmRunner) {
+    // Rewrite the oversized scene bodies instead of chopping them, so the
+    // decision still sees a faithful description of every scene.
+    const runner = opts.llmRunner;
+    semanticOutcome = await compressJevStateSemantically(
+      stateObject,
+      stateLimit,
+      async ({ filename, content, maxTokens, timeoutMs }) => {
+        const prompt = buildSemanticRewritePrompt(filename, content);
+        return runner.run({
+          prompt,
+          taskId: "jev-state-semantic",
+          timeoutMs,
+          maxTokens,
+        });
+      },
+    );
+    if (semanticOutcome.result) {
+      sentState = semanticOutcome.result.state;
+    }
+  }
+
+  if (sentState.length > stateLimit && (overflowPolicy === "trim" || overflowPolicy === "semantic")) {
+    // Either the policy is the positional trim, or the semantic pass could not
+    // bring the payload under the limit (or no runner was available).
     trimResult = trimJevStateForLimit(stateObject, stateLimit);
     if (trimResult) sentState = trimResult.state;
   }
@@ -272,7 +311,15 @@ export async function evaluateL3JevGate(opts: {
     state_sha256: sha256(sentState),
     state_chars: sentState.length,
     input_limit_chars: stateLimit,
-    truncated: trimResult !== null,
+    truncated: trimResult !== null || semanticOutcome?.result != null,
+    ...(semanticOutcome ? {
+      state_chars_untrimmed: state.length,
+      overflow_policy: overflowPolicy,
+      semantic_compressed_scenes: semanticOutcome.compressedScenes,
+      semantic_skipped_scenes: semanticOutcome.skippedScenes,
+      semantic_failures: semanticOutcome.failures.map((f) => ({ filename: f.filename, reason: f.reason })),
+      semantic_saved_chars: semanticOutcome.result ? semanticOutcome.result.savedChars : 0,
+    } : {}),
     ...(trimResult ? {
       state_chars_untrimmed: state.length,
       trimmed_scenes: trimResult.trimmedScenes,
@@ -285,6 +332,17 @@ export async function evaluateL3JevGate(opts: {
     } : {}),
   });
 
+  if (semanticOutcome) {
+    const compressed = semanticOutcome.compressedScenes.length;
+    const failed = semanticOutcome.failures.length;
+    opts.logger.warn(
+      `[memory-tdai] [l3-jev] input too large (${state.length} > ${stateLimit}); ` +
+      `semantic compression rewrote ${compressed} scene(s)` +
+      (failed > 0 ? `, ${failed} failed` : "") +
+      ` → ${sentState.length} chars before decision`,
+    );
+  }
+
   if (trimResult) {
     opts.logger.warn(
       `[memory-tdai] [l3-jev] input too large (${state.length} > ${stateLimit}); ` +
@@ -295,7 +353,8 @@ export async function evaluateL3JevGate(opts: {
   if (inputTooLarge) {
     opts.logger.warn(
       `[memory-tdai] [l3-jev] input too large (${sentState.length} > ${stateLimit}); deferring L3` +
-      (overflowPolicy === "trim" ? " (trim infeasible)" : ""),
+      (overflowPolicy === "trim" ? " (trim infeasible)" : "") +
+      (overflowPolicy === "semantic" ? " (semantic + trim infeasible)" : ""),
     );
     emitDecision(opts, correlation, {
       label: "unavailable",
