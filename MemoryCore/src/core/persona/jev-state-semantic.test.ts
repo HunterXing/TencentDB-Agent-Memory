@@ -4,10 +4,12 @@ import {
   compressJevStateSemantically,
   measureJevState,
   normalizeRewrittenBody,
+  resolveJevSemanticChunkChars,
   resolveJevSemanticMaxScenes,
   resolveJevSemanticMaxTokens,
   resolveJevSemanticMinRatio,
   resolveJevSemanticTimeoutMs,
+  splitSceneBody,
   validateRewrittenBody,
   type SemanticRewriteFn,
 } from "./jev-state-semantic.js";
@@ -28,6 +30,7 @@ function makePayload(bodies: Record<string, string>): JevStatePayload {
 describe("env resolution", () => {
   it("falls back to defaults when unset", () => {
     expect(resolveJevSemanticMaxTokens({} as NodeJS.ProcessEnv)).toBe(16_000);
+    expect(resolveJevSemanticChunkChars({} as NodeJS.ProcessEnv)).toBe(3_000);
     expect(resolveJevSemanticTimeoutMs({} as NodeJS.ProcessEnv)).toBe(120_000);
     expect(resolveJevSemanticMinRatio({} as NodeJS.ProcessEnv)).toBe(0.2);
     expect(resolveJevSemanticMaxScenes({} as NodeJS.ProcessEnv)).toBe(4);
@@ -112,6 +115,35 @@ describe("buildSemanticRewritePrompt", () => {
   });
 });
 
+describe("splitSceneBody", () => {
+  it("keeps a small body as a single chunk", () => {
+    expect(splitSceneBody("## 标题\n正文内容。", 3_000)).toEqual(["## 标题\n正文内容。"]);
+  });
+
+  it("splits on markdown headings and keeps every heading", () => {
+    const body = ["## 甲\n" + "甲".repeat(400), "## 乙\n" + "乙".repeat(400)].join("\n");
+    const chunks = splitSceneBody(body, 500);
+    expect(chunks.length).toBe(2);
+    expect(chunks[0].startsWith("## 甲")).toBe(true);
+    expect(chunks[1].startsWith("## 乙")).toBe(true);
+  });
+
+  it("cuts an oversized section on blank lines and repeats its heading", () => {
+    const para = "内容。".repeat(200);
+    const body = `## 长节\n\n${para}\n\n${para}`;
+    const chunks = splitSceneBody(body, 600);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeLessThanOrEqual(600);
+    }
+    expect(chunks[0].startsWith("## 长节")).toBe(true);
+  });
+
+  it("never returns an empty chunk for an empty body", () => {
+    expect(splitSceneBody("   ", 500)).toEqual([]);
+  });
+});
+
 describe("compressJevStateSemantically", () => {
   // A realistic rewrite keeps roughly half of the original body.
   const rewriteBody = (size: number) => "## 压缩\n" + "内容。".repeat(Math.max(1, Math.floor(size / 3)));
@@ -150,7 +182,7 @@ describe("compressJevStateSemantically", () => {
     const outcome = await compressJevStateSemantically(payload, 3000, rewrite);
     expect(outcome.compressedScenes).toEqual([]);
     expect(outcome.skippedScenes).toEqual(["big.md"]);
-    expect(outcome.failures[0].reason).toBe("provider down");
+    expect(outcome.failures[0].reason).toBe("chunk_error:provider down");
     // The scene body is untouched, so the payload still does not fit.
     expect(outcome.result).toBeNull();
   });
@@ -160,7 +192,24 @@ describe("compressJevStateSemantically", () => {
     const rewrite: SemanticRewriteFn = async () => "太短";
     const outcome = await compressJevStateSemantically(payload, 3000, rewrite);
     expect(outcome.compressedScenes).toEqual([]);
-    expect(outcome.failures[0].reason).toBe("too_small");
+    expect(outcome.failures[0].reason).toBe("chunk_too_small");
+  });
+
+  it("keeps the original text of a chunk the model could not rewrite", async () => {
+    // Two chunks: the first one is rewritten, the second one fails. The scene
+    // still uses the rewritten first chunk and the original second chunk.
+    const body = ["## 甲\n" + "甲".repeat(300), "## 乙\n" + "乙".repeat(300)].join("\n");
+    const payload = makePayload({ "big.md": body });
+    const rewrite: SemanticRewriteFn = async (input) => {
+      if (input.content.includes("乙")) throw new Error("chunk down");
+      return "## 甲\n" + "保留。".repeat(50);
+    };
+    const outcome = await compressJevStateSemantically(payload, 700, rewrite, { chunkChars: 400 });
+    expect(outcome.compressedScenes).toEqual(["big.md"]);
+    const state = JSON.parse(outcome.result?.state ?? "{}");
+    const content = state.changed_scenes?.[0]?.content ?? "";
+    expect(content).toContain("保留。");
+    expect(content).toContain("乙");
   });
 
   it("returns a null result when the payload still does not fit", async () => {

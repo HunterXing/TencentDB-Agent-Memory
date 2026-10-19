@@ -21,6 +21,7 @@ import {
 import {
   buildSemanticRewritePrompt,
   compressJevStateSemantically,
+  resolveJevSemanticTargetRatio,
   type JevSemanticOutcome,
 } from "./jev-state-semantic.js";
 import type { LLMRunner } from "../types.js";
@@ -207,6 +208,7 @@ export async function evaluateL3JevGate(opts: {
   const state = JSON.stringify(stateObject);
   const stateLimit = resolveJevStateLimit();
   const overflowPolicy = resolveJevOverflowPolicy();
+  const targetRatio = resolveJevSemanticTargetRatio();
   let sentState = state;
   let trimResult: JevTrimResult | null = null;
   let semanticOutcome: JevSemanticOutcome | null = null;
@@ -219,7 +221,7 @@ export async function evaluateL3JevGate(opts: {
       stateObject,
       stateLimit,
       async ({ filename, content, maxTokens, timeoutMs }) => {
-        const prompt = buildSemanticRewritePrompt(filename, content);
+        const prompt = buildSemanticRewritePrompt(filename, content, { targetRatio });
         return runner.run({
           prompt,
           taskId: "jev-state-semantic",
@@ -235,8 +237,14 @@ export async function evaluateL3JevGate(opts: {
 
   if (sentState.length > stateLimit && (overflowPolicy === "trim" || overflowPolicy === "semantic")) {
     // Either the policy is the positional trim, or the semantic pass could not
-    // bring the payload under the limit (or no runner was available).
-    trimResult = trimJevStateForLimit(stateObject, stateLimit);
+    // bring the payload under the limit (or no runner was available). The trim
+    // runs on the payload the semantic pass produced, so the work it did is
+    // not thrown away when the trim has to finish the job.
+    const trimInput =
+      overflowPolicy === "semantic" && semanticOutcome?.result
+        ? (JSON.parse(semanticOutcome.result.state) as typeof stateObject)
+        : stateObject;
+    trimResult = trimJevStateForLimit(trimInput, stateLimit);
     if (trimResult) sentState = trimResult.state;
   }
   const inputTooLarge = sentState.length > stateLimit;

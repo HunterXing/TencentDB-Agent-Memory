@@ -111,14 +111,20 @@ describe("evaluateL3JevGate semantic overflow policy", () => {
   };
 
   it("rewrites the oversized scene and calls the provider with the compressed body", async () => {
-    // The raw state (~20.5k) exceeds the limit; the rewritten state (~11.6k)
-    // fits, so no positional trim is needed.
-    vi.stubEnv("JEV_STATE_LIMIT_CHARS", "20000");
+    // The raw state (~12.5k) exceeds the limit; the rewritten state (~11.7k)
+    // fits, so no positional trim is needed. The body is rewritten in chunks,
+    // so the model is asked once per chunk.
+    vi.stubEnv("JEV_STATE_LIMIT_CHARS", "12000");
     vi.stubEnv("JEV_STATE_OVERFLOW_POLICY", "semantic");
-    await seed("P".repeat(300), [{ filename: "big.md", summary: "big scene", body: "B".repeat(20_000) }]);
+    vi.stubEnv("JEV_SEMANTIC_CHUNK_CHARS", "4000");
+    // A body with real section structure, so it splits into several chunks.
+    const sections = ["## 甲", "## 乙", "## 丙", "## 丁"]
+      .map((h) => `${h}\n${"内容。".repeat(1_000)}`)
+      .join("\n");
+    await seed("P".repeat(300), [{ filename: "big.md", summary: "big scene", body: sections }]);
 
-    // A realistic rewrite keeps roughly half of the original body.
-    const compressed = "## 压缩\n保留的有效事实。".repeat(800);
+    // A realistic rewrite keeps roughly half of the chunk it was given.
+    const compressed = "## 压缩\n保留的有效事实。".repeat(100);
     const { runner, prompts } = makeRunner(() => compressed);
     const { lines, logger } = makeLogger();
     const { calls, fetcher } = makeFetcher();
@@ -139,8 +145,8 @@ describe("evaluateL3JevGate semantic overflow policy", () => {
     expect(calls[0]).toContain("big scene");
     expect(calls[0]).toContain("保留的有效事实。");
     expect(calls[0]).not.toContain("[... truncated");
-    // The model was asked to rewrite this exact scene.
-    expect(prompts).toHaveLength(1);
+    // The model was asked to rewrite this exact scene, one chunk at a time.
+    expect(prompts.length).toBeGreaterThan(1);
     expect(prompts[0]).toContain("big.md");
     expect(lines.some((line) => line.includes("semantic compression rewrote 1 scene"))).toBe(true);
   });
