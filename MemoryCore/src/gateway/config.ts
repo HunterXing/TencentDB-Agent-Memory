@@ -651,6 +651,23 @@ export function loadGatewayConfig(overrides?: GatewayConfigOverrides): GatewayCo
     proxy: {
       useMemorySystemUserKey: bool(llmProxyConfig, "useMemorySystemUserKey") ?? true,
     },
+    // Thinking depth for reasoning models. MiniMax's OpenAI-compatible API
+    // defaults to `max` when the field is absent, so a reasoning model runs
+    // at its most expensive setting unless this is set explicitly.
+    //
+    // The accepted values are the ones that survive the whole path: the AI
+    // SDK refuses `off` while building the request, and the upstream gateway
+    // refuses `none` with HTTP 400. `off`/`none` are therefore rejected here
+    // too, so a typo surfaces as "unset" rather than a broken call.
+    reasoningEffort: (() => {
+      const raw = env("TDAI_LLM_REASONING_EFFORT") ?? str(llmConfig, "reasoningEffort");
+      if (raw === undefined) return undefined;
+      const normalized = raw.trim().toLowerCase();
+      const allowed = ["low", "medium", "high", "xhigh", "max"] as const;
+      return (allowed as readonly string[]).includes(normalized)
+        ? (normalized as (typeof allowed)[number])
+        : undefined;
+    })(),
     // env 存在时直接用 env 解析(可显式关闭 yaml);
     // env 未设置才回退 yaml,与其他 LLM 字段语义一致。
     stream: (() => {

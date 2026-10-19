@@ -1,5 +1,5 @@
 /**
- * JEV state overflow handling: configurable limit + optional trim policy.
+ * JEV state overflow handling: configurable limit + optional overflow policies.
  *
  * The L3 JEV gate feeds `{ current_persona, changed_scenes }` to the decision
  * provider. When the serialized payload exceeds the state limit, the stock
@@ -9,19 +9,31 @@
  * caller perceives a healthy no-op.
  *
  * This module keeps that defer path as the default (upstream-compatible) and
- * adds an opt-in `trim` policy: the oversized payload is shrunk to fit the
- * limit by truncating the content of the largest scenes (head + tail kept,
- * filenames/summaries always retained) so the gate can still produce a
- * decision from the (slightly incomplete) input.
+ * adds two opt-in policies:
  *
- * Env knobs (both optional; defaults preserve upstream behavior):
+ *   "trim"     - shrink the payload to fit by truncating the content of the
+ *                 largest scenes (head + tail kept, filenames/summaries always
+ *                 retained). Cheap, no model call, but lossy in a *positional*
+ *                 way: the cut lands wherever the byte budget happens to run
+ *                 out, which can remove exactly the paragraphs the decision
+ *                 needs.
+ *   "semantic" - ask an LLM to rewrite the oversized scenes into shorter but
+ *                 semantically equivalent versions (drop stale/superseded
+ *                 facts, collapse repeated narration, keep every still-valid
+ *                 fact), then re-serialize. Lossy in a *content* way but the
+ *                 surviving text is still a faithful summary of the scene, so
+ *                 the decision sees real information instead of a chopped
+ *                 middle. Falls back to "trim" when the model call fails or
+ *                 the result still does not fit.
+ *
+ * Env knobs (all optional; defaults preserve upstream behavior):
  *   JEV_STATE_LIMIT_CHARS       positive integer, default 32000
- *   JEV_STATE_OVERFLOW_POLICY   "defer" (default) | "trim"
+ *   JEV_STATE_OVERFLOW_POLICY   "defer" (default) | "trim" | "semantic"
  */
 
 export const JEV_STATE_LIMIT_CHARS_DEFAULT = 32_000;
 
-export type JevOverflowPolicy = "defer" | "trim";
+export type JevOverflowPolicy = "defer" | "trim" | "semantic";
 
 export function resolveJevStateLimit(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.JEV_STATE_LIMIT_CHARS?.trim();
@@ -33,9 +45,10 @@ export function resolveJevStateLimit(env: NodeJS.ProcessEnv = process.env): numb
 }
 
 export function resolveJevOverflowPolicy(env: NodeJS.ProcessEnv = process.env): JevOverflowPolicy {
-  return env.JEV_STATE_OVERFLOW_POLICY?.trim().toLowerCase() === "trim"
-    ? "trim"
-    : "defer";
+  const raw = env.JEV_STATE_OVERFLOW_POLICY?.trim().toLowerCase();
+  if (raw === "trim") return "trim";
+  if (raw === "semantic") return "semantic";
+  return "defer";
 }
 
 /** Subset of the JEV state payload this module reads or rewrites. */

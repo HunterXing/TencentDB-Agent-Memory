@@ -86,6 +86,36 @@ export interface StandaloneLLMConfig {
   model: string;
   /** Default max output tokens. */
   maxTokens?: number;
+  /**
+   * Thinking depth for reasoning models, sent as `reasoning_effort`.
+   *
+   * MiniMax's OpenAI-compatible API accepts `low` | `medium` | `high` |
+   * `xhigh` | `max` and **defaults to `max`** when the field is omitted, so
+   * a reasoning model called without this field thinks at its most
+   * expensive setting. Measured against the production gateway on a
+   * 3000-character document: `max` took 46s and 16565 reasoning tokens,
+   * `high` 40s and 11937, `medium` and `low` under 20s and under 1700.
+   *
+   * The value is only meaningful for models that support the parameter; a
+   * backend that does not know it ignores it.
+   */
+  /**
+   * Thinking depth for reasoning models, forwarded as `reasoning_effort`.
+   *
+   * Only the levels that survive both hops are listed. Disabling thinking is
+   * not representable on this path: the AI SDK rejects `off` while building
+   * the request, and the upstream gateway rejects `none` with HTTP 400 — so
+   * `off`/`none` are intentionally absent. Leaving the field unset does not
+   * mean "no thinking" either; MiniMax defaults to `max` when it is absent.
+   *
+   * Scope: the parameter is honored by OpenAI-compatible reasoning backends
+   * that implement it (verified against MiniMax-M3.1-Flash, where the level
+   * visibly changes both latency and reasoning-token count). A backend that
+   * ignores it — verified against deepseek-flash, where reasoning_tokens
+   * stayed pinned at the max_tokens ceiling for every level — will simply
+   * run unchanged, so treat this as best-effort rather than a guarantee.
+   */
+  reasoningEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   /** Request timeout in milliseconds (default: 120_000). */
   timeoutMs?: number;
   /**
@@ -257,6 +287,8 @@ export class StandaloneLLMRunner implements LLMRunner {
   private model: string;
   private enableTools: boolean;
   private stream: boolean;
+  /** Thinking depth sent as `reasoning_effort`; undefined leaves the backend default. */
+  private reasoningEffort?: StandaloneLLMConfig["reasoningEffort"];
   private logger?: Logger;
 
   /**
@@ -271,12 +303,14 @@ export class StandaloneLLMRunner implements LLMRunner {
     model?: string;
     enableTools?: boolean;
     stream?: boolean;
+    reasoningEffort?: StandaloneLLMConfig["reasoningEffort"];
     logger?: Logger;
   }) {
     this.config = opts.config;
     this.model = opts.model ?? opts.config.model;
     this.enableTools = opts.enableTools ?? false;
     this.stream = opts.stream ?? opts.config.stream ?? false;
+    this.reasoningEffort = opts.reasoningEffort ?? opts.config.reasoningEffort;
     this.logger = opts.logger;
   }
 
@@ -345,6 +379,13 @@ export class StandaloneLLMRunner implements LLMRunner {
         // backends emit spurious tool calls on pure-text tasks.
         ...(tools && Object.keys(tools).length > 0
           ? { tools, stopWhen: stepCountIs(maxIterations) }
+          : {}),
+        // The thinking depth is sent as `reasoning_effort`. Without it a
+        // reasoning model falls back to its most expensive setting, which
+        // on the production gateway meant 73s and 28185 reasoning tokens per
+        // call — long enough to trip the gateway's own request timeout.
+        ...(this.reasoningEffort
+          ? { providerOptions: { openai: { reasoningEffort: this.reasoningEffort } } }
           : {}),
         maxOutputTokens: maxTokens,
         abortSignal: combinedSignal,
