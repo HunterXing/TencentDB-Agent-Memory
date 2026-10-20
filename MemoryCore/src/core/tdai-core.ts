@@ -1219,6 +1219,14 @@ export class TdaiCore {
     const llmRunner = useStandaloneRunner
       ? trackingFactory.createRunner({ enableTools: true })
       : undefined;
+    // Text-only runner for the JEV gate's `semantic` overflow policy: it
+    // rewrites oversized scene bodies and must not be able to call tools.
+    // Service mode runs through this method, so the runner has to be wired
+    // here as well — without it the semantic pass is silently skipped and
+    // every oversized payload falls back to positional trimming.
+    const semanticLlmRunner = useStandaloneRunner
+      ? trackingFactory.createRunner({ enableTools: false })
+      : undefined;
 
     const runner = createL3Runner({
       pluginDataDir: this.dataDir,
@@ -1228,6 +1236,7 @@ export class TdaiCore {
       logger: this.logger,
       instanceId: this.instanceId,
       llmRunner,
+      semanticLlmRunner,
       storage: storage ?? this.getStorage(),
       checkpointLock,
     });
