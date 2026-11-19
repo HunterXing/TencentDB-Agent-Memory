@@ -425,6 +425,12 @@ export async function tryReportCreditFromPath(
   if (!spaceId || !usage || Object.keys(usage).length === 0) {
     return { attempted: false, ok: false };
   }
+  // 未配置上报地址 = 本部署没有 MemoryPlus 计费服务（如纯自托管），直接跳过。
+  // 缺这条守卫时 fetch("") 会抛 "Failed to parse URL from"，每次对话刷一条
+  // CREDIT_REPORT 错误日志（实测本机 6 小时 1920 条噪声，且掩盖真实故障）。
+  if (!config.url || !config.url.trim()) {
+    return { attempted: false, ok: false };
+  }
   const payload: CreditReportRequest = {
     SpaceId: spaceId,
     MemoryLevel: PROXY_MEMORY_LEVEL,
