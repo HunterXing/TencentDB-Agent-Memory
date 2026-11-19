@@ -40,6 +40,7 @@ import { writeGenerationProvenanceBestEffort } from "../core/memory-generation-l
 import { LocalStorageBackend } from "../core/storage/local-backend.js";
 import { StoragePaths } from "../core/storage/types.js";
 import { stripSceneNavigation } from "../core/scene/scene-navigation.js";
+import { capL2Batch } from "./l2-batch-cap.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
 import {
   readManifest,
@@ -793,25 +794,18 @@ export function createL2Runner(opts: {
     }
 
     // 单次抽取上限：冷启动或失败重试后游标可能落后很多，原实现会把全部积压
-    // 记录一次性塞进 prompt（实测 639 条 / 26.8 万字符）。这里按「条数 + 字符」
+    // 记录一次性塞进 prompt（实测 639 条 / 26.8 万字符）。按「条数 + 字符」
     // 双上限截断，游标只推进到本批最后一条，剩余记录留待下一轮处理。
-    const maxRecords = Math.max(1, cfg.pipeline.l2MaxMemoriesPerExtract ?? 150);
-    const maxChars = Math.max(1000, cfg.pipeline.l2MaxPromptChars ?? 150000);
-    if (records.length > maxRecords || records.reduce((n, r) => n + r.content.length, 0) > maxChars) {
-      const kept: typeof records = [];
-      let chars = 0;
-      for (const rec of records) {
-        if (kept.length >= maxRecords) break;
-        if (kept.length > 0 && chars + rec.content.length > maxChars) break;
-        chars += rec.content.length;
-        kept.push(rec);
-      }
-      if (kept.length < records.length) {
-        logger.info?.(
-          `${TAG} [L2] batch capped: ${kept.length}/${records.length} records, ${chars} chars (session=${sessionKey})`,
-        );
-        records = kept;
-      }
+    const capped = capL2Batch(records, {
+      maxRecords: cfg.pipeline.l2MaxMemoriesPerExtract ?? 150,
+      maxChars: cfg.pipeline.l2MaxPromptChars ?? 150000,
+    });
+    if (capped.capped) {
+      logger.info?.(
+        `${TAG} [L2] batch capped: ${capped.records.length}/${records.length} records, ` +
+          `${capped.chars} chars, ${capped.remaining} left for next run (session=${sessionKey})`,
+      );
+      records = capped.records;
     }
 
     const grouped = new Map<string, typeof records>();
