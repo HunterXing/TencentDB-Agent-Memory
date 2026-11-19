@@ -103,6 +103,14 @@ export interface PipelineTriggerConfig {
   l2MinIntervalSeconds: number;
   /** L2 max interval: even without new conversations, trigger L2 at most this often per session (default: 3600 = 60 min) */
   l2MaxIntervalSeconds: number;
+  /**
+   * L2 单次抽取最多喂多少条 L1 记忆（default: 150）。
+   * 冷启动/失败重试时游标可能落后很多，原先会把全部积压记录（实测 639 条 /
+   * 26.8 万字符）一次性塞进 prompt；超出的记录留待下一轮（游标只推进到本批）。
+   */
+  l2MaxMemoriesPerExtract: number;
+  /** L2 单次抽取输入内容字符上限（default: 150000），与条数上限同时生效，先到者为准。 */
+  l2MaxPromptChars: number;
   /** Sessions inactive longer than this (hours) stop L2 polling (default: 24) */
   sessionActiveWindowHours: number;
 }
@@ -684,6 +692,8 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       l2DelayAfterL1Seconds: num(pipelineGroup, "l2DelayAfterL1Seconds") ?? 10,
       l2MinIntervalSeconds: num(pipelineGroup, "l2MinIntervalSeconds") ?? 900,
       l2MaxIntervalSeconds: num(pipelineGroup, "l2MaxIntervalSeconds") ?? 3600,
+      l2MaxMemoriesPerExtract: num(pipelineGroup, "l2MaxMemoriesPerExtract") ?? 150,
+      l2MaxPromptChars: num(pipelineGroup, "l2MaxPromptChars") ?? 150000,
       sessionActiveWindowHours: num(pipelineGroup, "sessionActiveWindowHours") ?? 24,
     },
     recall: {

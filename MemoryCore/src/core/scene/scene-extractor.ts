@@ -252,8 +252,6 @@ export class SceneExtractor {
         created_at: m.created_at,
         id: m.id ?? "",
       })),
-      null,
-      2,
     );
 
     const currentTimestamp = formatTimestamp(new Date());
